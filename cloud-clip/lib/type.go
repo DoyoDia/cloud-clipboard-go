@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"io/fs"
 	"log"
 	"net/http"
 	"sync"
@@ -49,11 +50,12 @@ type PostData struct {
 
 // DeviceMeta 保存连接设备的信息
 type DeviceMeta struct {
-	ID      string `json:"id"`      // 设备ID
-	Type    string `json:"type"`    // 例如："Desktop", "Mobile"
-	Device  string `json:"device"`  // 例如："Apple Mac", "iPhone"
-	OS      string `json:"os"`      // 例如："macOS 14", "iOS 17"
-	Browser string `json:"browser"` // 例如："Chrome 120"
+	ID      string `json:"id"`             // 设备ID
+	Type    string `json:"type"`           // 例如："Desktop", "Mobile"
+	Name    string `json:"name,omitempty"` // 客户端声明的设备名；空表示未声明，前端按类型显示通用名称
+	Device  string `json:"device"`         // 例如："Apple Mac", "iPhone"
+	OS      string `json:"os"`             // 例如："macOS 14", "iOS 17"
+	Browser string `json:"browser"`        // 例如："Chrome 120"
 }
 
 // ClipboardServer 结构体定义
@@ -73,11 +75,77 @@ type ClipboardServer struct {
 	runMutex        sync.Mutex
 	parser          *uaparser.Parser // UA解析器实例
 	deviceHashSeed  uint32           // 将 deviceHashSeed 添加到服务器实例
+	shareSigningKey []byte           // 短期分享链接签名密钥
+	// history.json 的写盘锁。它有 7 个调用点，其中 handler 里两处是 `go s.saveHistoryData()`
+	// （改正文 / 看板挪列）—— 两个并发请求会同时写同一个路径，而 messageQueue 的锁
+	// 只保护内存切片、**不保护文件**，所以要独立一把。见 saveHistoryData 的注释。
+	historySaveMutex sync.Mutex
+	// 在途的异步落盘次数。handler 里有两处异步落盘（改正文、看板挪列），
+	// 它们必须**可等待** —— 否则进程退出或测试结束（TempDir 清理）时，
+	// 写临时文件的那只手还在动，清理会报 "directory not empty"。
+	historyWriteWG  sync.WaitGroup
+	shareTokenUsage map[string]*shareUsageEntry // jti -> 使用计数（进程内）
+	shareUsageMutex sync.Mutex
+
+	// 分享记录（share-log.json）：谁在哪个房间分享了什么、被打开了几次。
+	// 见 share_log.go 文件头部 —— 列表用房间凭据鉴权，开放房间 = 公开。
+	shareLog         map[string]*shareRecord // jti -> 记录
+	shareLogMutex    sync.Mutex
+	shareVisitDedupe map[string]int64 // "jti|访客" -> 上次上报时间，防刷计数
+
+	// 定时自动化任务（tasks.json）。范式与 shareLog 一致：懒加载 + 整份原子写。
+	// automationTasks 的读写一律在 automationMutex 内，见 task.go。
+	automationTasks  []*AutomationTask `json:"-"`
+	automationMutex  sync.Mutex        `json:"-"`
+	automationLoaded bool              `json:"-"`
+	automationStop   chan struct{}     `json:"-"`
+
+	// 前端静态资源的来源：嵌入式 FS 或外部目录（nil = 这次部署没有前端）。
+	// 发资源、`/s/<token>` 注入 OG、前端路由兜底都要从这里读外壳 index.html，见 spa_shell.go。
+	staticFS fs.FS `json:"-"`
 
 	// 添加房间管理相关字段
 	roomStats         map[string]*RoomStat `json:"-"` // 房间统计信息，不序列化
 	roomStatsMutex    sync.RWMutex         `json:"-"` // 房间统计读写锁
 	roomCleanupTicker *time.Ticker         `json:"-"` // 房间清理定时器
+
+	// 局域网延迟统计（WebSocket ping/pong RTT）
+	latency *latencyTracker `json:"-"`
+}
+
+// latencyTracker 维护最近若干次 WS ping/pong 往返时间样本，用于计算平均延迟
+type latencyTracker struct {
+	mu      sync.Mutex
+	samples []float64 // 毫秒
+	max     int
+}
+
+func newLatencyTracker(max int) *latencyTracker {
+	return &latencyTracker{samples: make([]float64, 0, max), max: max}
+}
+
+func (l *latencyTracker) add(ms float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.samples) >= l.max {
+		l.samples = append(l.samples[1:], ms)
+	} else {
+		l.samples = append(l.samples, ms)
+	}
+}
+
+// average 返回平均往返延迟（毫秒）；无样本时返回 -1
+func (l *latencyTracker) average() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.samples) == 0 {
+		return -1
+	}
+	sum := 0.0
+	for _, s := range l.samples {
+		sum += s
+	}
+	return sum / float64(len(l.samples))
 }
 
 // file item in File[]
@@ -99,12 +167,26 @@ type History struct {
 
 // ReceiveBase is the common structure for all receive types
 type ReceiveBase struct {
-	ID           int               `json:"id"`
-	Type         string            `json:"type"`
-	Room         string            `json:"room"`
-	Timestamp    int64             `json:"timestamp"`    // Unix timestamp (seconds)
-	SenderIP     string            `json:"senderIP"`     // 发送者 IP 地址
-	SenderDevice map[string]string `json:"senderDevice"` // 发送者设备信息 (来自 User-Agent 解析)
+	ID             int               `json:"id"`
+	Type           string            `json:"type"`
+	Room           string            `json:"room"`
+	Timestamp      int64             `json:"timestamp"`                // Unix timestamp (seconds)
+	SenderIP       string            `json:"senderIP"`                 // 发送者 IP 地址
+	SenderClientID string            `json:"senderClientID,omitempty"` // 发送端持久客户端 ID (用于收发气泡归属)
+	SenderDevice   map[string]string `json:"senderDevice"`             // 发送者设备信息 (来自 User-Agent 解析)
+	// Column 是看板的列（`todo` / `doing` / `done`）。空 = 待办 —— 看板只是条目的一个视图，
+	// 不是另一份数据，所以字段挂在条目自己身上，不另建表。见 handleContentColumn。
+	Column string `json:"column,omitempty"`
+
+	// Source 标记这条消息不是人发的 —— 目前只有 "automation"（定时任务）。
+	// 前端可据此加个角标，也可据此过滤：定时消息默认**不占房间历史额度**
+	// （见 deliverMessage 的 keepHistory），但实时广播照发。
+	Source string `json:"source,omitempty"`
+	// ScheduledAt 是定时任务的**预定触发时刻**（Unix 秒）。补发时它与 Timestamp
+	// 相差较大 —— 这是判断「这条是错过后补发的」的唯一依据。
+	ScheduledAt int64 `json:"scheduledAt,omitempty"`
+	// Late 标记这是一条错过触发窗口后补发的消息。
+	Late bool `json:"late,omitempty"`
 }
 
 // "text" type item in Receive[]

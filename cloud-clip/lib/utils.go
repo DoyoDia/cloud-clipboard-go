@@ -139,6 +139,58 @@ func min(a, b int) int {
 	return b
 }
 
+// writeFileAtomic 原子地写一个文件：写同目录临时文件 → fsync → rename。
+//
+// 为什么必须原子：os.WriteFile 是「截断 + 写入」，进程在写入过程中被杀（崩溃、OOM、
+// 容器被 kill、断电）会留下一个**半截文件**。而 history.json 是启动时唯一的数据来源，
+// 半截 JSON 解析失败 → 被当成损坏文件处理 → 用户的全部历史没了。
+//
+// 为什么临时文件必须放**同一个目录**：os.Rename 只有在同一文件系统内才是原子的，
+// 跨设备会退化成 copy + unlink（不原子）。放系统临时目录再 rename 是个常见错误。
+//
+// 为什么要 fsync：rename 只保证「目录项」的原子切换，不保证数据已经落盘。
+// 不 fsync 的话，断电后可能出现「rename 成功、文件却是空的」。
+//
+// 失败时临时文件会被清掉，不会在目录里攒一堆 .tmp-*。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	tmpName := tmp.Name()
+	// 任何一条失败路径都要清掉临时文件；rename 成功后把它置 false（那时文件已经不在原地了）
+	cleanup := true
+	defer func() {
+		if cleanup {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("写入临时文件失败: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("同步临时文件失败: %w", err)
+	}
+	// os.CreateTemp 建出来的是 0600，要显式改回调用方要的权限 ——
+	// rename 之后这个文件就是正式文件了，权限不会自己变回来。
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return fmt.Errorf("设置临时文件权限失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭临时文件失败: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("替换目标文件失败: %w", err)
+	}
+	cleanup = false
+	return nil
+}
+
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil || !os.IsNotExist(err)
@@ -152,8 +204,6 @@ func DetermineResponseType(filename string) string {
 	if mimeType != "" {
 		if strings.HasPrefix(mimeType, "image/") {
 			responseType = "image"
-		} else if strings.HasPrefix(mimeType, "text/") {
-			responseType = "text" // e.g., text/plain, text/html, text/css
 		} else if strings.HasPrefix(mimeType, "audio/") {
 			responseType = "audio"
 		} else if strings.HasPrefix(mimeType, "video/") {
@@ -297,14 +347,103 @@ func (r *ReceiveHolder) SenderDevice() map[string]string {
 	return nil
 }
 
-// parse_user_agent 现在使用 s.parser
-func (s *ClipboardServer) parse_user_agent(uaString string) map[string]string {
+// Column 是看板的列（空 = 待办）。文本和文件条目都能上板，所以两个分支都要认。
+func (r *ReceiveHolder) Column() string {
+	if r.TextReceive != nil {
+		return r.TextReceive.Column
+	} else if r.FileReceive != nil {
+		return r.FileReceive.Column
+	}
+	return ""
+}
+
+// SetColumn 写回列。两个分支都要写 —— 只写文本那支会让文件卡片「拖了没反应」。
+func (r *ReceiveHolder) SetColumn(column string) {
+	if r.TextReceive != nil {
+		r.TextReceive.Column = column
+	} else if r.FileReceive != nil {
+		r.FileReceive.Column = column
+	}
+}
+
+// detectDeviceType 将 User-Agent 归类为 desktop / smartphone / tablet，
+// 与前端 Device.vue 期望的类型保持一致。
+//
+// osFamily 是 UA 解析出的系统家族，只在关键词全部落空时兜底：快捷指令的 UA 是
+// BackgroundShortcutRunner，不含 mobile/iphone 等任何移动端关键词，只看关键词
+// 会把 iOS 设备判成 desktop，前端于是显示成「笔记本图标 + 桌面设备」，
+// 副标题却写着 "iOS 17" —— 自相矛盾，看着像 bug。
+func detectDeviceType(uaString string, osFamily string) string {
+	ua := strings.ToLower(uaString)
+	isTablet := strings.Contains(ua, "ipad") || strings.Contains(ua, "tablet") ||
+		strings.Contains(ua, "playbook") || strings.Contains(ua, "silk") || strings.Contains(ua, "kindle")
+	isMobile := !isTablet && (strings.Contains(ua, "mobile") || strings.Contains(ua, "iphone") || strings.Contains(ua, "android"))
+	switch {
+	case isTablet:
+		return "tablet"
+	case isMobile:
+		return "smartphone"
+	case isMobileOSFamily(osFamily):
+		return "smartphone"
+	default:
+		return "desktop"
+	}
+}
+
+// isMobileOSFamily 判断 UA 解析出的系统家族是否属于移动端
+func isMobileOSFamily(osFamily string) bool {
+	switch strings.ToLower(strings.TrimSpace(osFamily)) {
+	case "ios", "ipados", "android", "windows phone", "blackberry os", "symbian os":
+		return true
+	}
+	return false
+}
+
+const (
+	// deviceNameParam 客户端声明自身设备名所用的查询参数
+	deviceNameParam = "name"
+	// deviceNameMaxLen 设备名长度上限（按字符数，不是字节数）
+	deviceNameMaxLen = 32
+)
+
+// resolveDeviceName 读取客户端声明的设备名，返回空串表示未声明、调用方应回落 UA 推断。
+//
+// 名字只由发送端随每次请求带着走，服务端不存、不建表、不加接口 —— 浏览器的 UA
+// 本来就认得出自己，真正需要主动声明的只有快捷指令、curl 这类 UA 无法辨识的来源。
+func resolveDeviceName(r *http.Request) string {
+	return sanitizeDeviceName(r.URL.Query().Get(deviceNameParam))
+}
+
+// sanitizeDeviceName 清洗客户端传入的设备名，挡住日志污染与超长载荷
+func sanitizeDeviceName(raw string) string {
+	// 控制字符会污染服务端日志，也可能在前端渲染出意料之外的效果，直接剔除
+	name := strings.Map(func(ch rune) rune {
+		if ch < 0x20 || ch == 0x7f {
+			return -1
+		}
+		return ch
+	}, raw)
+	name = strings.TrimSpace(name)
+	// 按 rune 截断，避免把多字节字符切成半个
+	if runes := []rune(name); len(runes) > deviceNameMaxLen {
+		name = strings.TrimSpace(string(runes[:deviceNameMaxLen]))
+	}
+	return name
+}
+
+// parse_user_agent 现在使用 s.parser；deviceName 为客户端声明的设备名，
+// 为空时不写入 name 字段，使旧客户端的载荷与改动前逐字一致。
+func (s *ClipboardServer) parse_user_agent(uaString string, deviceName string) map[string]string {
 	client := s.parser.Parse(uaString) // 使用实例化的解析器
-	return map[string]string{
-		"type":    client.Device.Family,
+	info := map[string]string{
+		"type":    detectDeviceType(uaString, client.Os.Family),
 		"os":      fmt.Sprintf("%s %s", client.Os.Family, client.Os.Major),
 		"browser": fmt.Sprintf("%s %s", client.UserAgent.Family, client.UserAgent.Major),
 	}
+	if deviceName != "" {
+		info["name"] = deviceName
+	}
+	return info
 }
 
 // get_remote_ip(r *http.Request) (保持不变)

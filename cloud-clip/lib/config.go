@@ -20,10 +20,10 @@ type Config struct {
 		HistoryFile string      `json:"historyFile"` // 添加历史文件路径
 		StorageDir  string      `json:"storageDir"`  // 添加存储目录路径
 		// Auth    string `json:"auth"`
-		Auth     interface{}       `json:"auth"` //done
-		RoomAuth map[string]string `json:"roomAuth"`
-		Cert     string            `json:"cert"`
-		Key      string            `json:"key"`
+		Auth     interface{}    `json:"auth"` //done
+		RoomAuth RoomAuthConfig `json:"roomAuth"`
+		Cert     string         `json:"cert"`
+		Key      string         `json:"key"`
 
 		// 添加房间相关配置
 		RoomList    bool `json:"roomList"`    // 是否启用房间列表功能
@@ -37,6 +37,17 @@ type Config struct {
 		Chunk  int `json:"chunk"`  //done, but no limit
 		Limit  int `json:"limit"`  //done
 	} `json:"file"`
+	// Automation 定时自动化（tasks.json）。
+	//
+	// ⚠️ Enabled 默认 true，但「默认可用」不等于「默认放开」：能不能给**某个房间**装任务
+	// 由 roomAuth[x].automation 决定，公开房间默认是 none（见 auth.go 的
+	// resolveAutomationPolicy）。所以默认开着不会让任何房间凭空多出自动化能力。
+	Automation struct {
+		Enabled      bool   `json:"enabled"`
+		TickSeconds  int    `json:"tickSeconds"`
+		GraceSeconds int    `json:"graceSeconds"`
+		DefaultTZ    string `json:"defaultTZ"`
+	} `json:"automation"`
 }
 
 // var config_path = "config.json"
@@ -85,29 +96,35 @@ func defaultConfig() *Config {
 		storageDir = "/etc/cloud-clipboard/data/upload"
 	}
 
+	// ⚠️ 下面 Server.History = 50 与 Rust（`ServerConfig::default().history`）、
+	// Worker（`HISTORY_LIMIT` 的缺省）**是同一个数**（Jonny 2026-09-26 定：三端统一 50）。
+	//
+	// 它是**一根旋钮管三件事**：WS 握手推多少条历史、`GET /content` 的缺省与上限、
+	// 以及下发在 `server.history` 里给客户端看的那个数。改一处就得三处一起想 ——
+	// 详见 `docs/specs/ws-live-only.md` §2.1。
 	return &Config{
 		Server: struct {
-			Host        interface{}       `json:"host"`
-			Port        int               `json:"port"`
-			Prefix      string            `json:"prefix"`
-			History     int               `json:"history"`
-			HistoryFile string            `json:"historyFile"`
-			StorageDir  string            `json:"storageDir"`
-			Auth        interface{}       `json:"auth"`
-			RoomAuth    map[string]string `json:"roomAuth"`
-			Cert        string            `json:"cert"`
-			Key         string            `json:"key"`
-			RoomList    bool              `json:"roomList"`
-			RoomCleanup int               `json:"roomCleanup"`
+			Host        interface{}    `json:"host"`
+			Port        int            `json:"port"`
+			Prefix      string         `json:"prefix"`
+			History     int            `json:"history"`
+			HistoryFile string         `json:"historyFile"`
+			StorageDir  string         `json:"storageDir"`
+			Auth        interface{}    `json:"auth"`
+			RoomAuth    RoomAuthConfig `json:"roomAuth"`
+			Cert        string         `json:"cert"`
+			Key         string         `json:"key"`
+			RoomList    bool           `json:"roomList"`
+			RoomCleanup int            `json:"roomCleanup"`
 		}{
 			Host:        []string{"0.0.0.0"},
 			Port:        9501,
 			Prefix:      "",
-			History:     100,
+			History:     50, // 三端统一 50，见函数上方那段说明
 			HistoryFile: historyFile,
 			StorageDir:  storageDir,
 			Auth:        false,
-			RoomAuth:    map[string]string{},
+			RoomAuth:    RoomAuthConfig{},
 			Cert:        "",
 			Key:         "",
 			RoomList:    false, // 默认关闭房间列表功能
@@ -126,6 +143,21 @@ func defaultConfig() *Config {
 			Expire: 3600,
 			Chunk:  1 * _MB,
 			Limit:  256 * _MB,
+		},
+		Automation: struct {
+			Enabled      bool   `json:"enabled"`
+			TickSeconds  int    `json:"tickSeconds"`
+			GraceSeconds int    `json:"graceSeconds"`
+			DefaultTZ    string `json:"defaultTZ"`
+		}{
+			Enabled:      true,
+			TickSeconds:  30,
+			GraceSeconds: 600,
+			// 默认上海：这个项目的用户绝大多数在 +08:00，而「服务器本地时区」在容器里
+			// 常常是 UTC —— 一个「每天 09:30」的任务会因此在 17:30 发出去，
+			// 而且只有真到了那一天才看得出来。默认值选「用户很可能在的时区」，
+			// 比默认「服务器的时区」安全得多。
+			DefaultTZ: defaultAutomationTZName,
 		},
 	}
 }

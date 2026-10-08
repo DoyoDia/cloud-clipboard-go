@@ -5,6 +5,7 @@
 1. 根据您的 OpenWrt 版本下载对应格式的软件包
    - OpenWrt 25.12 及以上: 下载与设备 `cat /etc/apk/arch` 输出匹配的 APK 文件
    - OpenWrt 24.10 及以下: 下载与设备架构匹配的 IPK 文件
+   - 产物命名格式: `CCG_server-openwrt-apk-<架构>-v<版本>.apk` 和 `CCG_server-openwrt-ipk-<架构>-v<版本>.ipk`
    - arm-7: 适用于大多数ARM路由器
    - aarch64: 适用于64位ARM设备（如部分高端路由器）
    - mips/mipsel: 适用于传统路由器
@@ -15,22 +16,22 @@
 
 OpenWrt 25.12 及以上:
 
-`scp cloud-clipboard-1.0.0-aarch64_cortex-a53.apk root@192.168.1.1:/tmp/`
+`scp CCG_server-openwrt-apk-aarch64_cortex-a53-v1.0.0.apk root@192.168.1.1:/tmp/`
 
 OpenWrt 24.10 及以下:
 
-`scp cloud-clipboard_1.0.0_arm_cortex-a7.ipk root@192.168.1.1:/tmp/`
+`scp CCG_server-openwrt-ipk-arm_cortex-a7-v1.0.0.ipk root@192.168.1.1:/tmp/`
 
 
 3. 通过SSH连接到设备并安装
 
 OpenWrt 25.12 及以上:
 
-`apk add --allow-untrusted /tmp/cloud-clipboard-1.0.0-aarch64_cortex-a53.apk`
+`apk add --allow-untrusted /tmp/CCG_server-openwrt-apk-aarch64_cortex-a53-v1.0.0.apk`
 
 OpenWrt 24.10 及以下:
 
-`opkg install /tmp/cloud-clipboard_1.0.0_arm_cortex-a7.ipk`
+`opkg install /tmp/CCG_server-openwrt-ipk-arm_cortex-a7-v1.0.0.ipk`
 
 4. 配置服务
 
@@ -91,10 +92,10 @@ Cloud Clipboard还提供了LuCI界面，可以方便地在OpenWrt管理页面进
 1. 安装主应用包（如上方步骤所示）
 2. 安装LuCI界面包
 OpenWrt 25.12 及以上:
-`apk add --allow-untrusted /tmp/luci-app-cloud-clipboard-1.0.0-noarch.apk`
+`apk add --allow-untrusted /tmp/CCG_server-luci-apk-noarch-v1.0.0.apk`
 
 OpenWrt 24.10 及以下:
-`opkg install /tmp/luci-app-cloud-clipboard_1.0.0_all.ipk`
+`opkg install /tmp/CCG_server-luci-ipk-all-v1.0.0.ipk`
 3. 重启LuCI
 `/etc/init.d/uhttpd restart`
 4. 在OpenWrt管理界面的"服务"菜单下找到"Cloud Clipboard"
@@ -103,5 +104,7 @@ OpenWrt 24.10 及以下:
 
 1. 登录OpenWrt管理界面
 2. 进入"服务" > "Cloud Clipboard"
-3. 设置服务参数并启用服务
-4. 点击保存并应用
+3. **总览**:查看运行状态、监听参数、数据盘占用、检查最新版本，并可直接启停/重启服务
+4. **基本设置**:设置服务开关、监听地址、监听端口与访问密码，点击"保存并应用"
+5. **高级设置**:结构化配置房间密码与逐房间文件过期（`fileExpire`）、文本/文件传输限制；也可以展开"专家模式"直接编辑 `config.json`
+6. **日志**:实时查看运行日志，支持自动刷新与清空

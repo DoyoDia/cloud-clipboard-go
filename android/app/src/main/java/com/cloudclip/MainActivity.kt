@@ -1,73 +1,112 @@
 package com.cloudclip
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.view.LayoutInflater
 import android.view.View
+import android.view.ViewGroup
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
+import androidx.core.os.LocaleListCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.google.android.material.bottomnavigation.BottomNavigationView
+import com.google.android.material.floatingactionbutton.FloatingActionButton
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.common.BitMatrix
+import com.google.zxing.qrcode.QRCodeWriter
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
-    private lateinit var statusText: TextView
+    private lateinit var pageServices: View
+    private lateinit var pageSync: View
+    private lateinit var pageSettings: View
+    private lateinit var bottomNav: BottomNavigationView
+    private lateinit var powerFab: FloatingActionButton
+    private lateinit var statusChip: TextView
+    private lateinit var coverTitle: TextView
+    private lateinit var coverSubtitle: TextView
+    private lateinit var statDevices: TextView
+    private lateinit var statTodaySyncs: TextView
+    private lateinit var statLatency: TextView
+    private lateinit var infoLan: TextView
+    private lateinit var infoPort: TextView
+    private lateinit var infoAuth: TextView
+    private lateinit var infoDir: TextView
+    private lateinit var qrImage: ImageView
     private lateinit var addressText: TextView
+    private lateinit var addressActions: View
     private lateinit var portInput: EditText
     private lateinit var authInput: EditText
-    private lateinit var startStopButton: Button
-    private lateinit var advancedSettingsButton: Button
     private lateinit var storageDirText: TextView
     private lateinit var historyFileText: TextView
-    private lateinit var addressLayout: View
-    private lateinit var openBrowserButton: ImageButton
-    private lateinit var copyAddressButton: ImageButton
-    private lateinit var githubButton: ImageButton
+    private lateinit var copyAddressButton: TextView
+    private lateinit var openBrowserButton: TextView
+    private lateinit var githubButton: TextView
+    private lateinit var helpButton: TextView
+    private lateinit var syncEmpty: TextView
+    private lateinit var syncList: ListView
+    private lateinit var moreSettingsHeader: View
+    private lateinit var moreSettingsArrow: TextView
+    private lateinit var moreSettingsPanel: View
+    private lateinit var textLimitInput: EditText
+    private lateinit var fileExpireInput: EditText
+    private lateinit var fileLimitInput: EditText
+    private lateinit var historyCountInput: EditText
+    private lateinit var roomListSwitch: Switch
+    private lateinit var roomAuthInput: EditText
+    private lateinit var previewConfigButton: TextView
+    private lateinit var saveConfigButton: TextView
+    private lateinit var languageRow: View
+    private lateinit var languageValue: TextView
+    private lateinit var versionText: TextView
 
     private val handler = Handler(Looper.getMainLooper())
     private val updateRunnable = object : Runnable {
         override fun run() {
             updateStatus()
             if (ClipboardService.isRunning) {
-                // 如果服务正在运行,继续定期更新
                 handler.postDelayed(this, 1000)
             }
         }
     }
 
-    // 创建广播接收器
     private val serviceStoppedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ClipboardService.ACTION_SERVICE_STOPPED) {
-                // 收到服务停止的广播后，更新UI
                 updateStatus()
             }
         }
     }
 
-    // 注册目录选择器回调
     private val openDirectoryLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             result.data?.data?.also { uri ->
-                // 获得持久化权限
                 contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-                
-                // 保存并显示路径
                 val prefs = getSharedPreferences("config", MODE_PRIVATE).edit()
                 prefs.putString("storageDirUri", uri.toString())
                 prefs.apply()
-                storageDirText.text = CloudClipboardPaths.getPathFromUri(this, uri)
+                storageDirText.text = CloudClipboardPaths.shortDirName(CloudClipboardPaths.getPathFromUri(this, uri))
+                historyFileText.text = CloudClipboardPaths.shortDirName(CloudClipboardPaths.getPathFromUri(this, uri)) + File.separator + "history.json"
             }
         }
     }
@@ -75,64 +114,114 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        window.statusBarColor = android.graphics.Color.parseColor("#1F6FEB")
 
-        statusText = findViewById(R.id.statusText)
+        pageServices = findViewById(R.id.pageServices)
+        pageSync = findViewById(R.id.pageSync)
+        pageSettings = findViewById(R.id.pageSettings)
+        bottomNav = findViewById(R.id.bottomNav)
+        powerFab = findViewById(R.id.powerFab)
+        statusChip = findViewById(R.id.statusChip)
+        coverTitle = findViewById(R.id.coverTitle)
+        coverSubtitle = findViewById(R.id.coverSubtitle)
+        statDevices = findViewById(R.id.statDevices)
+        statTodaySyncs = findViewById(R.id.statTodaySyncs)
+        statLatency = findViewById(R.id.statLatency)
+        infoLan = findViewById(R.id.infoLan)
+        infoPort = findViewById(R.id.infoPort)
+        infoAuth = findViewById(R.id.infoAuth)
+        infoDir = findViewById(R.id.infoDir)
+        qrImage = findViewById(R.id.qrImage)
         addressText = findViewById(R.id.addressText)
+        addressActions = findViewById(R.id.addressActions)
         portInput = findViewById(R.id.portInput)
         authInput = findViewById(R.id.authInput)
-        startStopButton = findViewById(R.id.startStopButton)
-        advancedSettingsButton = findViewById(R.id.advancedSettingsButton)
         storageDirText = findViewById(R.id.storageDirText)
         historyFileText = findViewById(R.id.historyFileText)
-        addressLayout = findViewById(R.id.addressLayout)
-        openBrowserButton = findViewById(R.id.openBrowserButton)
         copyAddressButton = findViewById(R.id.copyAddressButton)
+        openBrowserButton = findViewById(R.id.openBrowserButton)
         githubButton = findViewById(R.id.githubButton)
+        helpButton = findViewById(R.id.helpButton)
+        syncEmpty = findViewById(R.id.syncEmpty)
+        syncList = findViewById(R.id.syncList)
+        moreSettingsHeader = findViewById(R.id.moreSettingsHeader)
+        moreSettingsArrow = findViewById(R.id.moreSettingsArrow)
+        moreSettingsPanel = findViewById(R.id.moreSettingsPanel)
+        textLimitInput = findViewById(R.id.textLimitInput)
+        fileExpireInput = findViewById(R.id.fileExpireInput)
+        fileLimitInput = findViewById(R.id.fileLimitInput)
+        historyCountInput = findViewById(R.id.historyCountInput)
+        roomListSwitch = findViewById(R.id.roomListSwitch)
+        roomAuthInput = findViewById(R.id.roomAuthInput)
+        previewConfigButton = findViewById(R.id.previewConfigButton)
+        saveConfigButton = findViewById(R.id.saveConfigButton)
+        languageRow = findViewById(R.id.languageRow)
+        languageValue = findViewById(R.id.languageValue)
+        versionText = findViewById(R.id.versionText)
+
+        val pkgInfo = packageManager.getPackageInfo(packageName, 0)
+        versionText.text = "v${pkgInfo.versionName}"
 
         loadConfig()
-        
+        loadMoreSettings()
+        loadLanguage()
+
+        // 底部导航切换
+        bottomNav.setOnItemSelectedListener { item ->
+            when (item.itemId) {
+                R.id.nav_services -> {
+                    showPage(pageServices)
+                    true
+                }
+                R.id.nav_sync -> {
+                    showPage(pageSync)
+                    loadHistory()
+                    true
+                }
+                R.id.nav_settings -> {
+                    showPage(pageSettings)
+                    true
+                }
+                else -> false
+            }
+        }
+
+        // 悬浮电源按钮: 启动/停止
+        powerFab.setOnClickListener { toggleService() }
+
         storageDirText.setOnClickListener {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
             openDirectoryLauncher.launch(intent)
         }
-        // 历史文件将存储在存储目录中，因此其选择器与存储目录联动
         historyFileText.setOnClickListener { storageDirText.performClick() }
-
-        startStopButton.setOnClickListener {
-            if (ClipboardService.isRunning) {
-                // Stop the service
-                stopService(Intent(this, ClipboardService::class.java))
-                handler.removeCallbacks(updateRunnable) // 停止轮询
-                // 不再需要立即调用 updateStatus()，等待广播通知
-                // updateStatus() 
-            } else {
-                // Start the service
-                saveConfig() // 保存当前配置
-                val intent = Intent(this, ClipboardService::class.java).apply {
-                    putExtra("port", portInput.text.toString().toIntOrNull() ?: 9501)
-                    putExtra("auth", authInput.text.toString())
-                    // 传递URI字符串
-                    val prefs = getSharedPreferences("config", MODE_PRIVATE)
-                    putExtra("storageDirUri", prefs.getString("storageDirUri", null))
-                }
-                startForegroundService(intent)
-                
-                // 延迟后开始检查状态，给服务启动时间
-                handler.postDelayed({
-                    handler.post(updateRunnable) // 启动轮询
-                }, 1000) // 1秒延迟足够
-            }
-        }
-
-        advancedSettingsButton.setOnClickListener {
-            val intent = Intent(this, AdvancedSettingsActivity::class.java)
-            startActivity(intent)
-        }
 
         githubButton.setOnClickListener {
             val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Jonnyan404/cloud-clipboard-go"))
             startActivity(intent)
         }
+
+        helpButton.setOnClickListener {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Jonnyan404/cloud-clipboard-go#readme"))
+            startActivity(intent)
+        }
+
+        moreSettingsHeader.setOnClickListener {
+            val visible = moreSettingsPanel.visibility == View.GONE
+            moreSettingsPanel.visibility = if (visible) View.VISIBLE else View.GONE
+            moreSettingsArrow.text = if (visible) "▴" else "▾"
+        }
+
+        previewConfigButton.setOnClickListener {
+            showConfigPreview()
+        }
+
+        saveConfigButton.setOnClickListener {
+            if (saveMoreSettings()) {
+                Toast.makeText(this, R.string.config_saved, Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        languageRow.setOnClickListener { showLanguageDialog() }
 
         openBrowserButton.setOnClickListener {
             val url = addressText.text.toString()
@@ -148,8 +237,36 @@ class MainActivity : AppCompatActivity() {
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 val clip = ClipData.newPlainText("Server Address", url)
                 clipboard.setPrimaryClip(clip)
-                Toast.makeText(this, "地址已复制", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, R.string.address_copied, Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+
+    private fun showPage(page: View) {
+        pageServices.visibility = if (page === pageServices) View.VISIBLE else View.GONE
+        pageSync.visibility = if (page === pageSync) View.VISIBLE else View.GONE
+        pageSettings.visibility = if (page === pageSettings) View.VISIBLE else View.GONE
+        if (page === pageServices) {
+            updateStatus()
+        }
+    }
+
+    private fun toggleService() {
+        if (ClipboardService.isRunning) {
+            stopService(Intent(this, ClipboardService::class.java))
+            handler.removeCallbacks(updateRunnable)
+        } else {
+            saveConfig()
+            val intent = Intent(this, ClipboardService::class.java).apply {
+                putExtra("port", portInput.text.toString().toIntOrNull() ?: 9501)
+                putExtra("auth", authInput.text.toString())
+                val prefs = getSharedPreferences("config", MODE_PRIVATE)
+                putExtra("storageDirUri", prefs.getString("storageDirUri", null))
+            }
+            startForegroundService(intent)
+            handler.postDelayed({
+                handler.post(updateRunnable)
+            }, 1000)
         }
     }
 
@@ -158,17 +275,16 @@ class MainActivity : AppCompatActivity() {
         portInput.setText(prefs.getInt("port", 9501).toString())
         authInput.setText(prefs.getString("auth", ""))
 
-        // 加载并显示持久化的路径
         val storageDirUriString = prefs.getString("storageDirUri", null)
         if (storageDirUriString != null) {
             val uri = Uri.parse(storageDirUriString)
             val resolvedPath = CloudClipboardPaths.getPathFromUri(this, uri)
-            storageDirText.text = resolvedPath
-            historyFileText.text = resolvedPath + File.separator + "history.json"
+            storageDirText.text = CloudClipboardPaths.shortDirName(resolvedPath)
+            historyFileText.text = CloudClipboardPaths.shortDirName(resolvedPath) + File.separator + "history.json"
         } else {
             val defaultBaseDir = CloudClipboardPaths.resolveBaseDir(this)
-            storageDirText.text = defaultBaseDir.absolutePath
-            historyFileText.text = File(defaultBaseDir, "history.json").absolutePath
+            storageDirText.text = CloudClipboardPaths.shortDirName(defaultBaseDir.absolutePath)
+            historyFileText.text = CloudClipboardPaths.shortDirName(defaultBaseDir.absolutePath) + File.separator + "history.json"
         }
     }
 
@@ -176,55 +292,344 @@ class MainActivity : AppCompatActivity() {
         val prefs = getSharedPreferences("config", MODE_PRIVATE).edit()
         prefs.putInt("port", portInput.text.toString().toIntOrNull() ?: 9501)
         prefs.putString("auth", authInput.text.toString())
-        // 路径URI已在选择时保存，此处无需重复保存
         prefs.apply()
     }
 
-    private fun updateStatus() {
-        if (ClipboardService.isRunning) {
-            statusText.text = getString(R.string.service_running)
-            addressText.text = ClipboardService.address
-            startStopButton.text = getString(R.string.stop_service)
-            startStopButton.setBackgroundColor(Color.parseColor("#FF4081")) // 红色系
-            
-            if (ClipboardService.address.isNotEmpty()) {
-                addressLayout.visibility = View.VISIBLE
+    private fun configJson(): JSONObject {
+        val configFile = CloudClipboardPaths.resolveConfigFile(this)
+        val json = if (configFile.exists()) {
+            try {
+                JSONObject(configFile.readText())
+            } catch (e: Exception) {
+                JSONObject()
             }
-
         } else {
-            statusText.text = getString(R.string.service_stopped)
-            addressText.text = ""
-            startStopButton.text = getString(R.string.start_service)
-            startStopButton.setBackgroundColor(Color.parseColor("#3F51B5")) // 蓝色系
-            addressLayout.visibility = View.GONE
+            JSONObject()
+        }
+
+        if (!json.has("server")) json.put("server", JSONObject())
+        if (!json.has("text")) json.put("text", JSONObject())
+        if (!json.has("file")) json.put("file", JSONObject())
+        return json
+    }
+
+    private fun loadMoreSettings() {
+        try {
+            val json = configJson()
+            val text = json.optJSONObject("text")
+            val file = json.optJSONObject("file")
+            val server = json.optJSONObject("server")
+            textLimitInput.setText((text?.optInt("limit") ?: 4096).toString())
+            fileExpireInput.setText((file?.optInt("expire") ?: 3600).toString())
+            fileLimitInput.setText((file?.optLong("limit")?.div(1024 * 1024) ?: 256).toString())
+            historyCountInput.setText((server?.optInt("history") ?: 100).toString())
+            roomListSwitch.isChecked = server?.optBoolean("roomList") ?: false
+            roomAuthInput.setText(renderRoomAuth(server?.optJSONObject("roomAuth")))
+        } catch (e: Exception) {
+            textLimitInput.setText("4096")
+            fileExpireInput.setText("3600")
+            fileLimitInput.setText("256")
+            historyCountInput.setText("100")
+            roomListSwitch.isChecked = false
+            roomAuthInput.setText("")
+        }
+    }
+
+    // roomAuth(形如 {"private":{"password":"123","fileExpire":3600}}) -> 每行 "房间名=密码,过期秒数"(过期秒数可选)
+    private fun renderRoomAuth(roomAuth: JSONObject?): String {
+        if (roomAuth == null) return ""
+        val lines = mutableListOf<String>()
+        for (key in roomAuth.keys()) {
+            if (key == "__default__") continue
+            val entry = roomAuth.optJSONObject(key)
+            val pass = entry?.optString("password")
+            if (key.isNotEmpty() && !pass.isNullOrEmpty()) {
+                val expire = entry?.optInt("fileExpire", Int.MIN_VALUE)
+                lines.add(if (expire != null && expire != Int.MIN_VALUE) "$key=$pass,$expire" else "$key=$pass")
+            }
+        }
+        return lines.joinToString("\n")
+    }
+
+    // 每行 "房间名=密码[,过期秒数]" -> roomAuth JSON
+    private fun parseRoomAuth(text: String): JSONObject {
+        val result = JSONObject()
+        for (line in text.lines()) {
+            val trimmed = line.trim()
+            if (trimmed.isEmpty()) continue
+            val eq = trimmed.indexOf('=')
+            val room = if (eq > 0) trimmed.substring(0, eq).trim() else trimmed.trim()
+            val rest = if (eq > 0) trimmed.substring(eq + 1).trim() else ""
+            if (room.isEmpty()) continue
+            val comma = rest.lastIndexOf(',')
+            val pass = if (comma > 0) rest.substring(0, comma).trim() else rest.trim()
+            val expireText = if (comma > 0) rest.substring(comma + 1).trim() else ""
+            val expire = expireText.toIntOrNull()
+            if (pass.isEmpty()) continue
+            val entry = JSONObject()
+            entry.put("password", pass)
+            if (expire != null) {
+                entry.put("fileExpire", expire)
+            }
+            result.put(room, entry)
+        }
+        return result
+    }
+
+    private fun buildConfigJson(): JSONObject {
+        val baseDir = CloudClipboardPaths.resolveBaseDir(this)
+
+        val server = JSONObject()
+        server.put("host", "0.0.0.0")
+        server.put("port", portInput.text.toString().toIntOrNull() ?: 9501)
+        server.put("prefix", "")
+        server.put("history", historyCountInput.text.toString().toIntOrNull() ?: 100)
+        server.put("historyFile", File(baseDir, "history.json").absolutePath)
+        server.put("storageDir", File(baseDir, "uploads").absolutePath)
+        server.put("auth", authInput.text.toString())
+        server.put("roomAuth", parseRoomAuth(roomAuthInput.text.toString()))
+        server.put("cert", "")
+        server.put("key", "")
+        server.put("roomList", roomListSwitch.isChecked)
+        server.put("roomCleanup", 3600)
+
+        val text = JSONObject()
+        text.put("limit", textLimitInput.text.toString().toIntOrNull() ?: 4096)
+
+        val file = JSONObject()
+        file.put("expire", fileExpireInput.text.toString().toIntOrNull() ?: 3600)
+        file.put("chunk", 1024 * 1024)
+        file.put("limit", (fileLimitInput.text.toString().toLongOrNull() ?: 256) * 1024 * 1024)
+
+        val json = JSONObject()
+        json.put("server", server)
+        json.put("text", text)
+        json.put("file", file)
+        return json
+    }
+
+    private fun saveMoreSettings(): Boolean {
+        return try {
+            val f = CloudClipboardPaths.resolveConfigFile(this)
+            android.util.Log.i("CloudClipboard", "saveMoreSettings: writing ${f.absolutePath}")
+            f.writeText(buildConfigJson().toString(2))
+            android.util.Log.i("CloudClipboard", "saveMoreSettings: OK")
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("CloudClipboard", "saveMoreSettings failed", e)
+            false
+        }
+    }
+
+    private fun showConfigPreview() {
+        val jsonText = buildConfigJson().toString(2)
+        val scroll = ScrollView(this)
+        val tv = TextView(this).apply {
+            text = jsonText
+            typeface = android.graphics.Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(0xFF232D3D.toInt())
+            setPadding(24, 24, 24, 24)
+        }
+        scroll.addView(tv)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.config_preview_title)
+            .setView(scroll)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
+    }
+
+    private fun loadLanguage() {
+        updateLanguageValue()
+    }
+
+    private fun updateLanguageValue() {
+        languageValue.text = when (getSharedPreferences("config", MODE_PRIVATE).getString("language", "system")) {
+            "zh" -> getString(R.string.language_zh)
+            "en" -> getString(R.string.language_en)
+            else -> getString(R.string.language_system)
+        }
+    }
+
+    private fun showLanguageDialog() {
+        val options = arrayOf(getString(R.string.language_system), getString(R.string.language_zh), getString(R.string.language_en))
+        val values = arrayOf("system", "zh", "en")
+        val current = getSharedPreferences("config", MODE_PRIVATE).getString("language", "system")
+        val checked = values.indexOf(current).coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.language_choose)
+            .setSingleChoiceItems(options, checked) { dialog, which ->
+                setLanguage(values[which])
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun setLanguage(code: String) {
+        val prefs = getSharedPreferences("config", MODE_PRIVATE).edit()
+        val target = when (code) {
+            "zh" -> LocaleListCompat.forLanguageTags("zh-CN")
+            "en" -> LocaleListCompat.forLanguageTags("en-US")
+            else -> LocaleListCompat.getEmptyLocaleList()
+        }
+        prefs.putString("language", code)
+        prefs.apply()
+        AppCompatDelegate.setApplicationLocales(target)
+    }
+
+    private fun loadHistory() {
+        try {
+            val historyFile = File(historyFileText.text.toString())
+            val adapter = HistoryAdapter(this, historyFile)
+            syncList.adapter = adapter
+            syncEmpty.visibility = if (adapter.count == 0) View.VISIBLE else View.GONE
+        } catch (e: Exception) {
+            syncList.adapter = null
+            syncEmpty.visibility = View.VISIBLE
+        }
+    }
+
+    private fun updateStatus() {
+        val hasAuth = authInput.text.toString().isNotEmpty()
+
+        if (ClipboardService.isRunning) {
+            statusChip.text = getString(R.string.service_running)
+            statusChip.setBackgroundResource(R.drawable.chip_running)
+            coverTitle.text = getString(R.string.cover_title_running)
+            coverSubtitle.text = getString(R.string.cover_subtitle_running)
+            addressText.text = ClipboardService.address
+            powerFab.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.parseColor("#19A560")))
+            powerFab.setImageResource(R.drawable.ic_power)
+
+            if (ClipboardService.address.isNotEmpty()) {
+                addressActions.visibility = View.VISIBLE
+                val ip = ClipboardService.address
+                    .removePrefix("http://")
+                    .removePrefix("https://")
+                    .substringBefore(":")
+                    .ifEmpty { "--" }
+                val deviceCount = ClipboardService.onlineDeviceCount.toString()
+                val todaySyncs = ClipboardService.todaySyncCount.toString()
+                val latency = ClipboardService.averageLatency
+                statDevices.text = deviceCount
+                statTodaySyncs.text = todaySyncs
+                statLatency.text = if (latency >= 0) {
+                    String.format("%.1f ms", latency)
+                } else {
+                    "--"
+                }
+                infoLan.text = ip
+                infoPort.text = portInput.text.toString().takeIf { it.isNotEmpty() } ?: "9501"
+                infoAuth.text = getString(if (hasAuth) R.string.stat_auth_on else R.string.stat_auth_off)
+                infoDir.text = storageDirText.text.toString()
+                generateQr(ClipboardService.address)
+            }
+        } else {
+            statusChip.text = getString(R.string.service_stopped)
+            statusChip.setBackgroundResource(R.drawable.chip_stopped)
+            coverTitle.text = getString(R.string.cover_title_stopped)
+            coverSubtitle.text = getString(R.string.cover_subtitle_stopped)
+            addressText.text = "--"
+            powerFab.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.parseColor("#1677D0")))
+            powerFab.setImageResource(R.drawable.ic_power)
+            addressActions.visibility = View.GONE
+            statDevices.text = "--"
+            statTodaySyncs.text = "--"
+            statLatency.text = "--"
+            qrImage.setImageDrawable(null)
+        }
+    }
+
+    private fun generateQr(content: String) {
+        try {
+            val hints = HashMap<EncodeHintType, Any>()
+            hints[EncodeHintType.MARGIN] = 0
+            hints[EncodeHintType.CHARACTER_SET] = "UTF-8"
+            val matrix: BitMatrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, 220, 220, hints)
+
+            val bmp = Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.RGB_565)
+            for (x in 0 until matrix.width) {
+                for (y in 0 until matrix.height) {
+                    bmp.setPixel(x, y, if (matrix.get(x, y)) Color.BLACK else Color.WHITE)
+                }
+            }
+            qrImage.setImageBitmap(bmp)
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "QR 生成失败", e)
+            qrImage.setImageDrawable(null)
         }
     }
 
     override fun onResume() {
         super.onResume()
-        // 注册广播接收器
         LocalBroadcastManager.getInstance(this).registerReceiver(
             serviceStoppedReceiver,
             IntentFilter(ClipboardService.ACTION_SERVICE_STOPPED)
         )
 
         updateStatus()
-        // 如果服务正在运行,启动定期更新
         if (ClipboardService.isRunning) {
             handler.post(updateRunnable)
         }
     }
-    
+
     override fun onPause() {
         super.onPause()
-        // 注销广播接收器
         LocalBroadcastManager.getInstance(this).unregisterReceiver(serviceStoppedReceiver)
-        // 停止定期更新
         handler.removeCallbacks(updateRunnable)
     }
-    
+
     override fun onDestroy() {
         super.onDestroy()
         handler.removeCallbacks(updateRunnable)
+    }
+}
+
+/** 同步记录适配器: 读取 history.json receive[] 展示 */
+class HistoryAdapter(context: Context, historyFile: File) : BaseAdapter() {
+    private val items = mutableListOf<Pair<String, String>>() // time, content
+    private val inflater = LayoutInflater.from(context)
+
+    init {
+        try {
+            val text = historyFile.readText()
+            val json = JSONObject(text)
+            val receive = json.optJSONArray("receive") ?: JSONArray()
+            val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
+            for (i in receive.length() - 1 downTo 0) {
+                val obj = receive.optJSONObject(i) ?: continue
+                val type = obj.optString("type")
+                if (type != "text") continue
+                val ts = obj.optLong("timestamp") * 1000
+                val content = obj.optString("content").take(120)
+                val room = obj.optString("room")
+                val label = if (room.isNotEmpty()) "[$room] $content" else content
+                items.add(Pair(fmt.format(Date(ts)), label))
+                if (items.size >= 50) break
+            }
+        } catch (e: Exception) {
+            // 文件不存在或解析失败 -> 空列表
+        }
+    }
+
+    override fun getCount(): Int = items.size
+    override fun getItem(position: Int): Any = items[position]
+    override fun getItemId(position: Int): Long = position.toLong()
+
+    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+        val v = convertView ?: inflater.inflate(android.R.layout.simple_list_item_2, parent, false).also {
+            it.setPadding(24, 18, 24, 18)
+        }
+        val (time, content) = items[position]
+        val t1 = v.findViewById<TextView>(android.R.id.text1)
+        val t2 = v.findViewById<TextView>(android.R.id.text2)
+        t1.text = content
+        t1.setTextColor(0xFF1A2433.toInt())
+        t1.textSize = 14f
+        t2.text = time
+        t2.setTextColor(0xFF8B93A1.toInt())
+        t2.textSize = 11f
+        return v
     }
 }

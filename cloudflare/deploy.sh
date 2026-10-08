@@ -13,7 +13,7 @@ echo "=== 部署 Cloud Clipboard 到 Cloudflare ==="
 echo ""
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 echo "!!! 部署前请先检查并修改 workers/wrangler.toml.template !!!"
-echo "!!! 特别是 AUTH_PASSWORD、ROOM_AUTH、ROOM_LIST 等变量     !!!"
+echo "!!! 特别是 AUTH_PASSWORD、ROOM_AUTH_JSON、ROOM_LIST 等变量    !!!"
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 echo ""
 
@@ -61,6 +61,31 @@ should_run_local_d1() {
     fi
 
     return 0
+}
+
+# 为已存在的 messages 表幂等补充 senderClientID 列
+# 说明: schema.sql 的 CREATE TABLE IF NOT EXISTS 不会给已有表加列,
+# 这里用 pragma_table_info 检查列是否存在,缺列时才执行 ALTER TABLE。
+migrate_senderClientID_col() {
+    local scope="$1"
+    local flags=""
+    [ "$scope" = "remote" ] && flags="--remote"
+    [ "$scope" = "local" ] && flags="--local"
+
+    info "检查 senderClientID 列 ($scope)..."
+    local has_col
+    has_col=$(wrangler d1 execute cloud-clipboard-db $flags \
+      --command "SELECT count(*) AS c FROM pragma_table_info('messages') WHERE name='senderClientID';" 2>/dev/null \
+      | grep -oE '"c"[[:space:]]*:[[:space:]]*[01]' | grep -oE '[01]' | head -1)
+
+    if [ "$has_col" != "1" ]; then
+        info "为 messages 表添加 senderClientID 列 ($scope)..."
+        wrangler d1 execute cloud-clipboard-db $flags --yes \
+          --command "ALTER TABLE messages ADD COLUMN senderClientID TEXT;" \
+          || warn "添加 senderClientID 列失败 ($scope)，请手动执行迁移"
+    else
+        info "senderClientID 列已存在，跳过迁移 ($scope)"
+    fi
 }
 
 # 检查必要工具
@@ -143,10 +168,14 @@ deploy_worker() {
     info "执行远程数据库迁移..."
     wrangler d1 execute cloud-clipboard-db --file=../d1/schema.sql --remote
     
+    # 幂等补齐旧库缺失的 senderClientID 列（每次部署都安全执行）
+    migrate_senderClientID_col "remote"
+
     # 可选：同时迁移本地数据库用于开发
     if should_run_local_d1; then
         info "执行本地数据库迁移..."
         wrangler d1 execute cloud-clipboard-db --file=../d1/schema.sql --local
+        migrate_senderClientID_col "local"
     else
         info "已跳过本地数据库迁移，不影响远程部署。"
     fi
@@ -162,8 +191,8 @@ deploy_worker() {
     DEPLOY_OUTPUT=$(wrangler deploy --env="" 2>&1)
     
     # 提取 Worker URL
-    if echo "$DEPLOY_OUTPUT" | grep -q "https://"; then
-        WORKER_URL=$(echo "$DEPLOY_OUTPUT" | grep -o 'https://[^[:space:]]*' | head -1)
+    if echo "$DEPLOY_OUTPUT" | grep -q "workers.dev"; then
+        WORKER_URL=$(echo "$DEPLOY_OUTPUT" | grep -o 'https://[^[:space:]]*\.workers\.dev' | head -1)
         # 移除可能的尾部斜杠
         WORKER_URL=${WORKER_URL%/}
         info "Worker 部署成功: $WORKER_URL"
@@ -179,70 +208,50 @@ deploy_worker() {
     echo "$WORKER_URL" > .worker_url
 }
 
-# 步骤 4: 更新前端配置
-update_frontend_config() {
-    info "=== 步骤 4: 更新前端配置 ==="
-    
-    # 读取 Worker URL
-    WORKER_URL=$(cat .worker_url)
-    
-    # 更新前端配置文件
-    info "更新前端配置文件..."
-    cd pages/client/src || exit 1
-    
-    # 创建配置文件
-    cp config.js.template config.js
-    
-    # 更新配置文件中的 Worker URL
-    sed "${SED_INPLACE[@]}" "s|https://your-worker.your-subdomain.workers.dev|$WORKER_URL|g" config.js
-    
-    info "前端配置已更新，Worker URL: $WORKER_URL"
-    
-    cd ../../..
-}
+# 步骤 4: 构建 Vue3 前端并拷贝为 Worker 静态资源
+build_frontend_assets() {
+    info "=== 步骤 4: 构建 Vue3 前端 (web-vue3) ==="
 
-# 步骤 5: 构建并部署前端
-deploy_frontend() {
-    info "=== 步骤 5: 构建并部署前端 ==="
-    
-    cd pages/client || exit 1
-    
-    # 安装前端依赖
-    info "安装前端依赖..."
-    npm install
-    
-    # 构建前端
+    if [ ! -d "../web-vue3" ]; then
+        error "未找到 web-vue3 目录，请确保在仓库根目录的 cloudflare/ 下执行本脚本"
+        exit 1
+    fi
+
+    cd ../web-vue3 || exit 1
+
+    if [ ! -d "node_modules" ]; then
+        info "安装前端依赖..."
+        npm install
+    fi
+
     info "构建前端..."
     npm run build
-    
-    # 首先尝试创建 Pages 项目（如果不存在）
-    info "检查/创建 Cloudflare Pages 项目..."
-    wrangler pages project create cloud-clipboard-pages  --production-branch=main  || warn "项目可能已存在"
-    
-    # 部署到 Cloudflare Pages
-    info "部署到 Cloudflare Pages..."
-    PAGES_OUTPUT=$(wrangler pages deploy dist --project-name=cloud-clipboard-pages)
-    
-    # 提取 Pages URL
-    if echo "$PAGES_OUTPUT" | grep -q "https://"; then
-        PAGES_URL=$(echo "$PAGES_OUTPUT" | grep -o 'https://[^[:space:]]*' | grep 'pages.dev' | head -1)
-        info "前端部署成功: $PAGES_URL"
-        
-        # 保存 Pages URL 到临时文件
-        echo "$PAGES_URL" > ../../.pages_url
-    else
-        warn "无法自动获取 Pages URL，请手动检查"
-        echo "$PAGES_OUTPUT"
-    fi
-    
-    cd ../..
+
+    info "拷贝构建产物到 Worker 静态资源目录..."
+    local ASSETS_DIR="../cloudflare/workers/assets"
+    rm -rf "$ASSETS_DIR"
+    mkdir -p "$ASSETS_DIR"
+
+    # 拷贝 dist 内容，排除 .gz/.br 压缩副本（Workers Static Assets 自动协商压缩）
+    for item in dist/*; do
+        local base
+        base=$(basename "$item")
+        case "$base" in
+            *.gz|*.br) continue ;;
+        esac
+        cp -R "$item" "$ASSETS_DIR/"
+    done
+
+    info "前端静态资源已就绪，共 $(find "$ASSETS_DIR" -type f | wc -l | tr -d ' ') 个文件"
+
+    cd ../cloudflare || exit 1
 }
 
 # 清理临时文件
 cleanup() {
     info "清理临时文件..."
     rm -f .d1_database_id .worker_url .pages_url
-    rm -f pages/client/src/config.js workers/wrangler.toml
+    rm -f workers/wrangler.toml
 }
 
 # 显示部署结果
@@ -250,15 +259,13 @@ show_results() {
     info "=== 部署完成! ==="
     
     WORKER_URL=$(cat .worker_url 2>/dev/null || echo "请手动检查")
-    PAGES_URL=$(cat .pages_url 2>/dev/null || echo "请手动检查")
     
     echo ""
     echo "🎉 部署结果:"
-    echo "  - Worker API: $WORKER_URL"
-    echo "  - 前端地址: $PAGES_URL"
+    echo "  - 一体化 Worker (静态 + API): $WORKER_URL"
     echo ""
     echo "📝 后续步骤:"
-    echo "  1. 访问前端地址测试功能"
+    echo "  1. 访问 $WORKER_URL 测试功能"
     echo "  2. 如需自定义域名，请在 Cloudflare Dashboard 中配置"
     echo "  3. 可在 Worker 设置中配置环境变量（如认证密码）"
     echo ""
@@ -270,8 +277,9 @@ show_results() {
     echo "!!! 如果你在部署前没有修改 wrangler.toml.template        !!!"
     echo "!!! 部署完成后务必去 Cloudflare Workers 后台检查并修改变量 !!!"
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "  - 已支持 /api/content/latest、/api/content/:id 及对应 .json 路由"
-    echo "  - 当前与 Go 版仍有少量行为差异，例如部分文件内容请求会重定向到 /api/file"
+    echo "  - 已支持 /content/latest、/content/:id 及对应 .json 路由（无 /api 前缀，与自托管 Go 对齐）"
+    echo "  - 已支持分块上传 /upload/chunk、/upload/chunk/:uuid、/upload/finish/:uuid"
+    echo "  - 静态资源与 SPA 导航请求免费，仅 API 请求计费"
 }
 
 # 错误处理
@@ -282,9 +290,8 @@ main() {
     check_requirements
     create_d1_database
     create_r2_bucket
+    build_frontend_assets
     deploy_worker
-    update_frontend_config
-    deploy_frontend
     show_results
 }
 

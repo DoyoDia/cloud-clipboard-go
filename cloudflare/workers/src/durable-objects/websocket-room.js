@@ -1,9 +1,16 @@
 import { normalizeRoomName, resolveRoomAuth } from '../auth';
-import { buildSenderDevice, parseUserAgent } from '../utils';
+import { historyLimit, parseUserAgent, sanitizeDeviceName } from '../utils';
 
 function isRoomListEnabled(env) {
   return ['1', 'true', 'yes', 'on'].includes(String(env.ROOM_LIST || '').toLowerCase());
 }
+
+// 在线会话视为活跃的最大间隔（超过则视为离开），与前端 30s 心跳配合
+const PRESENCE_TTL_MS = 120 * 1000;
+// 清理任务的调度间隔
+const PRESENCE_CLEAN_INTERVAL_MS = 60 * 1000;
+// 同一会话写 D1 的最小间隔（节流心跳 30s 带来的频繁写入）
+const PRESENCE_WRITE_INTERVAL_MS = 120 * 1000;
 
 export class WebSocketRoom {
   constructor(state, env) {
@@ -11,6 +18,8 @@ export class WebSocketRoom {
     this.env = env;
     this.sessions = new Map();
     console.log('WebSocketRoom 实例创建');
+    // 安排周期性的残留在线状态清理
+    this.state.blockConcurrencyWhile(() => this.schedulePresenceCleanup());
   }
 
   async fetch(request) {
@@ -56,6 +65,7 @@ export class WebSocketRoom {
       const userAgent = request.headers.get('User-Agent') || '';
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
       const room = normalizeRoomName(url.searchParams.get('room'));
+      this.roomName = this.roomName || room;
       
       console.log(`创建 WebSocket 会话: ${sessionId}, room: ${room}, ip: ${ip}`);
       
@@ -65,7 +75,8 @@ export class WebSocketRoom {
         userAgent,
         ip,
         room: room,
-        connectedAt: Date.now()
+        connectedAt: Date.now(),
+        lastPresenceTouchedAt: 0
       };
 
       this.sessions.set(sessionId, session);
@@ -89,21 +100,28 @@ export class WebSocketRoom {
         this.handleError(sessionId, event);
       });
 
-      // 与 Go 后端保持一致：先发送历史，再发送配置，再同步设备。
-      await this.sendHistoryMessages(server, room);
-      await this.sendConfigMessage(server, room);
-      await this.sendExistingDevices(server, room, sessionId);
+      // 握手载荷的发送顺序抽在 sendHandshake 里（历史不再由 WS 推，见那里的注释）。
+      await this.sendHandshake(server, room, sessionId);
 
       // 广播新设备连接
       this.broadcastDeviceConnect(sessionId, userAgent, room);
 
       console.log(`WebSocket 会话 ${sessionId} 初始化完成`);
 
-      // 返回 WebSocket 响应
-      return new Response(null, {
+      // 回显客户端通过 Sec-WebSocket-Protocol 子协议提供的 token，避免 token 出现在 URL/访问日志中。
+      // 浏览器要求服务端必须回选一个子协议，否则握手会被判定失败。
+      const response = new Response(null, {
         status: 101,
         webSocket: client,
       });
+      const requestedProtocols = request.headers.get('Sec-WebSocket-Protocol');
+      if (requestedProtocols) {
+        const subprotocol = requestedProtocols.split(',')[0].trim();
+        if (subprotocol) {
+          response.headers.set('Sec-WebSocket-Protocol', subprotocol);
+        }
+      }
+      return response;
 
     } catch (error) {
       console.error('WebSocket 升级失败:', error);
@@ -113,7 +131,59 @@ export class WebSocketRoom {
     }
   }
 
-  async sendConfigMessage(webSocket, room) {
+  // 握手时依次发：config → 房间里已有的设备。
+  //
+  // ⚠️★ **顺序是契约，不是碰巧**（`docs/specs/ws-live-only.md` §2.2）：
+  // `config` 事件**必须**在实时之前发 —— 客户端在拿到 `config.latestId` 之前
+  // **一条都不该写剪贴板**（它要用那个 id 对齐「HTTP 取回的历史」与「WS 推来的实时」）。
+  // 别为了首屏快一点把 config 挪到后面去。
+  //
+  // ⚠️★ **握手不再推历史**（Jonny 2026-09-26：「没有老客户端，不用考虑老客户端」）。
+  // 历史改由客户端自己去 `GET /content` 拿；原来那个 `?history=0` 开关也一并删掉
+  // （默认就是不推，它与默认同义，留着只会是一处会漂的冗余）。
+  //
+  // ⚠️ 抽成独立方法（而不是写在 handleWebSocket 里）是为了**能测**：handleWebSocket
+  // 需要真的 `WebSocketPair`，Node 里造不出来；而这一段的全部输入只是
+  // 「一个能 send 的对象 + 一个房间名」。
+  async sendHandshake(webSocket, room, sessionId) {
+    // ⚠️ 水印要在**发 config 之前**取：它是「连接时刻」的快照，客户端拿它对齐
+    // 「HTTP 取回的历史」与「WS 推来的实时」的边界。晚于 config 就已经没意义了。
+    const latestId = await this.latestMessageId(room);
+
+    await this.sendConfigMessage(webSocket, room, latestId);
+    await this.sendExistingDevices(webSocket, room, sessionId);
+  }
+
+  // 连接时刻该房间的**最大消息 id**（没有消息时 `0`）—— 客户端拿它对边界。
+  //
+  // ⚠️★ **它现在的职责**：客户端是**自己去 `GET /content` 拿历史**的，而「HTTP 取历史」
+  // 与「WS 收实时」之间有个**时序窗口** —— 请求返回之前可能已经推来几条实时消息。
+  // 有了 `latestId`，客户端才能对齐那条边界：`id <= latestId` 只当历史认领（**不写剪贴板**），
+  // `id > latestId` 才是实时。少了它，边界上的消息会被处理两次（或把历史灌进剪贴板）。
+  // 它**兼作能力探测信号**：老后端（没有 `/content`、也就没这个字段）不下发它，
+  // 新客户端据此退回「靠 WS 推历史」的老路（`docs/specs/ws-live-only.md` §0.4）。
+  //
+  // ⚠️ 用 `MAX(id)`，不是「取最新那条的 id」：最新那条是按 `timestamp DESC, id DESC` 挑的，
+  // 而 `POST /text?id=` **原地改正文**会把 timestamp 往前刷、id 不变 —— 于是它可能给出一个
+  // **偏小**的值，而偏小是**不安全**的方向（历史消息会被当成实时、写进剪贴板）。
+  async latestMessageId(room) {
+    if (!this.env.DB) {
+      return 0;
+    }
+    try {
+      const row = await this.env.DB.prepare(
+        'SELECT MAX(id) AS latestId FROM messages WHERE room = ?'
+      ).bind(normalizeRoomName(room)).first();
+      return Number(row?.latestId) || 0;
+    } catch (error) {
+      // 取不到水印**不是**致命错误：回 `0` 等于告诉客户端「这个后端没法区分历史与实时」，
+      // 而客户端对那种后端的行为是**拒绝自动写剪贴板**（fail-safe，见 spec §0.4 / §7 第 11 条）。
+      console.error('取水印失败:', error);
+      return 0;
+    }
+  }
+
+  async sendConfigMessage(webSocket, room, latestId = 0) {
     try {
       const fileLimit = parseInt(this.env.FILE_LIMIT) || 104857600;
       const multipartPartSize = fileLimit > 5 * 1024 * 1024
@@ -124,7 +194,9 @@ export class WebSocketRoom {
         data: {
           version: 'cloudflare-worker-v1.0.0',
           server: {
-            history: parseInt(this.env.HISTORY_LIMIT) || 10,
+            // ⚠️ 与 WS 推历史、落库裁剪、`GET /content` 的上限是**同一个数**
+            // （utils.js 的 historyLimit 一处定义）—— 别在这里手写 parseInt(env.HISTORY_LIMIT)。
+            history: historyLimit(this.env),
             prefix: '',
             roomList: isRoomListEnabled(this.env)
           },
@@ -136,7 +208,20 @@ export class WebSocketRoom {
             chunk: multipartPartSize,
             limit: fileLimit
           },
-          auth: resolveRoomAuth(this.env, room).required
+          auth: resolveRoomAuth(this.env, room).required,
+          // 连接时刻该房间的**最大消息 id**（没有消息时 0）—— 客户端拿它对齐
+          // 「HTTP 取回的历史」与「WS 推来的实时」的边界（理由见上面 latestMessageId 那段）。
+          // ⚠️★ 它**必须在 WebSocket 握手载荷里**，**不是** `/server` 的 HTTP 响应 ——
+          // 前端读的 `app.config` 就是**这条 `config` 事件**（这个坑踩过两次：
+          // `automation.enabled`、`prefix`）。加错地方会得到一个永远 `undefined` 的字段。
+          latestId,
+          // 定时自动化：Worker 侧**没有实现**这一族接口（没有 /tasks、没有 /automation，
+          // 也没有进程内调度器）。显式声明 enabled:false，而不是让这个字段干脆缺失 ——
+          // SPA 工具栏那个入口正是按它决定渲不渲染（PageToolbar.vue 的 automationEnabled），
+          // 而前端读的 `app.config` 就是**这条 config 事件**的载荷（不是 /server 的响应）。
+          // 缺失的话，前端分不清「这个后端不支持」和「字段还没送到」。
+          // ⚠️ 哪天 Worker 侧真的实现了，记得连同 docs/api*.md §8 的「仅 Go 实现」一起改。
+          automation: { enabled: false }
         }
       };
       
@@ -147,102 +232,6 @@ export class WebSocketRoom {
       
     } catch (error) {
       console.error('发送配置消息失败:', error);
-    }
-  }
-
-  async sendHistoryMessages(webSocket, room) {
-    try {
-      console.log(`获取房间 ${room} 的历史消息`);
-      
-      if (!this.env.DB) {
-        console.log('DB binding 不可用，跳过历史消息');
-        return;
-      }
-
-      if (webSocket.readyState !== WebSocket.OPEN) {
-        console.log('WebSocket 未就绪，跳过历史消息');
-        return;
-      }
-
-      // 获取历史消息限制，默认为 10
-      const historyLimit = parseInt(this.env.HISTORY_LIMIT || '10');
-      console.log(`历史消息限制: ${historyLimit}`);
-
-      const query = `
-        SELECT * FROM (
-          SELECT * FROM messages
-          WHERE room = ?
-          ORDER BY timestamp DESC, id DESC
-          LIMIT ?
-        ) recent
-        ORDER BY timestamp ASC, id ASC
-      `;
-      const params = [normalizeRoomName(room), historyLimit];
-      
-      console.log(`历史消息查询: ${query}, 参数:`, params, `限制: ${historyLimit}`);
-      
-      const results = await this.env.DB.prepare(query).bind(...params).all();
-      
-      if (!results.results || results.results.length === 0) {
-        console.log(`房间 ${room} 没有历史消息`);
-        return;
-      }
-
-      console.log(`找到 ${results.results.length} 条历史消息 (限制: ${historyLimit})`);
-
-      // 发送历史消息
-      for (const row of results.results) {
-        if (webSocket.readyState !== WebSocket.OPEN) {
-          console.log('WebSocket 已关闭，停止发送历史消息');
-          break;
-        }
-
-        const historyMessage = {
-          event: 'receive',
-          data: {
-            id: row.id,
-            type: row.type,
-            timestamp: row.timestamp,
-            room: row.room || 'default',
-            senderIP: row.senderIP || 'unknown',
-            senderDevice: buildSenderDevice(row.userAgent || 'unknown')
-          }
-        };
-
-        // 根据消息类型添加相应字段
-        if (row.type === 'text') {
-          historyMessage.data.content = row.content;
-        } else if (row.type === 'file') {
-          // 为历史文件消息添加图标
-          const FileHandler = await import('../handlers/file.js');
-          const fileIcon = FileHandler.FileHandler.getFileTypeIcon(row.name);
-          const displayName = `${fileIcon} ${row.name}`;
-          
-          historyMessage.data.name = displayName;
-          historyMessage.data.size = row.size;
-          historyMessage.data.uuid = row.uuid;
-          historyMessage.data.url = row.url;
-          
-          // 处理过期时间
-          let expireTime = row.expireTime;
-          if (expireTime && expireTime.toString().length === 10) {
-            expireTime = expireTime * 1000;
-          }
-          historyMessage.data.expire = expireTime;
-          historyMessage.data.cache = row.uuid;
-        }
-        
-        console.log(`发送历史消息: ID ${row.id}, 类型 ${row.type}`);
-        
-        webSocket.send(JSON.stringify(historyMessage));
-        
-      }
-      
-      console.log(`历史消息发送完成，共发送 ${results.results.length} 条 (限制: ${historyLimit})`);
-      
-    } catch (error) {
-      console.error('发送历史消息失败:', error);
-      console.error('Error details:', error.stack);
     }
   }
 
@@ -281,8 +270,29 @@ export class WebSocketRoom {
 
   handleMessage(sessionId, event) {
     try {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        // 前端每 30s 会发送空文本帧作为心跳；任何消息都视为该会话仍活跃。
+        const now = Date.now();
+        session.connectedAt = now;
+        // 节流：仅当距上次写 D1 超过间隔才落库，避免心跳带来的频繁写入
+        if (now - session.lastPresenceTouchedAt >= PRESENCE_WRITE_INTERVAL_MS) {
+          session.lastPresenceTouchedAt = now;
+          void this.touchSessionPresence(sessionId, now);
+        }
+      }
       if (event.data && event.data.trim()) {
         console.log(`WebSocket 消息 from ${sessionId}:`, event.data);
+
+        // Web 端延迟测量: 客户端发送 {"event":"ping","data":<clientMs>},
+        // 与 Go 后端行为一致，原样回显 data，客户端用 (Date.now()-data) 计算 RTT。
+        let parsed;
+        try {
+          parsed = JSON.parse(event.data);
+        } catch {}
+        if (parsed && parsed.event === 'ping' && typeof parsed.data === 'number') {
+          session.webSocket.send(JSON.stringify({ event: 'pong', data: parsed.data }));
+        }
       }
     } catch (error) {
       console.error(`处理消息错误 (${sessionId}):`, error);
@@ -311,7 +321,7 @@ export class WebSocketRoom {
     void this.removeSessionPresence(sessionId);
   }
 
-  broadcastDeviceConnect(sessionId, userAgent, room) {
+  broadcastDeviceConnect(sessionId, userAgent, room, deviceName = '') {
     try {
       const deviceInfo = parseUserAgent(userAgent);
       
@@ -320,6 +330,7 @@ export class WebSocketRoom {
         data: {
           id: sessionId,
           type: deviceInfo.type,
+          name: sanitizeDeviceName(deviceName),
           device: deviceInfo.device,
           os: deviceInfo.os,
           browser: deviceInfo.browser
@@ -410,6 +421,57 @@ export class WebSocketRoom {
       await this.env.DB.prepare('DELETE FROM room_presence WHERE sessionId = ?').bind(sessionId).run();
     } catch (error) {
       console.error(`删除房间在线状态失败 (${sessionId}):`, error);
+    }
+  }
+
+  async touchSessionPresence(sessionId, updatedAt) {
+    if (!this.env.DB) {
+      return;
+    }
+    try {
+      await this.env.DB.prepare('UPDATE room_presence SET updatedAt = ? WHERE sessionId = ?')
+        .bind(Math.floor(updatedAt / 1000), sessionId)
+        .run();
+    } catch (error) {
+      console.error(`更新会话活跃时间失败 (${sessionId}):`, error);
+    }
+  }
+
+  async schedulePresenceCleanup() {
+    const now = Date.now();
+    let existingAlarm = now;
+    try {
+      existingAlarm = (await this.state.storage.getAlarm()) ?? now;
+    } catch (error) {
+      console.error('读取已有清理任务失败，将按当前时间重新安排:', error);
+    }
+    await this.state.storage.setAlarm(Math.max(now, existingAlarm) + PRESENCE_CLEAN_INTERVAL_MS);
+  }
+
+  async alarm() {
+    try {
+      await this.cleanupStalePresence(this.roomName || '');
+    } catch (error) {
+      console.error('清理残留在线状态失败:', error);
+    } finally {
+      await this.schedulePresenceCleanup();
+    }
+  }
+
+  async cleanupStalePresence(room = '') {
+    if (!this.env.DB) {
+      return;
+    }
+    const cutoff = Math.floor((Date.now() - PRESENCE_TTL_MS) / 1000);
+    const statement = room
+      ? this.env.DB.prepare('DELETE FROM room_presence WHERE room = ? AND updatedAt < ?')
+          .bind(room, cutoff)
+      : this.env.DB.prepare('DELETE FROM room_presence WHERE updatedAt < ?')
+          .bind(cutoff);
+    const result = await statement.run();
+    const removed = result?.meta?.changes ?? 0;
+    if (removed > 0) {
+      console.log(`清理了 ${removed} 条过期在线状态${room ? ` (房间: ${room})` : ''}`);
     }
   }
 

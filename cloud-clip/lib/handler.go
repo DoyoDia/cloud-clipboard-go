@@ -1,19 +1,114 @@
 package lib
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
+
+// roomSessionTTLSeconds 房间会话令牌的有效期，默认 1 小时。
+const roomSessionTTLSeconds = 60 * 60
+
+func (s *ClipboardServer) handleAuthToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed", "仅允许 POST 请求")
+		return
+	}
+
+	room := normalizeRoomName(r.URL.Query().Get("room"))
+	if room == "" {
+		room = "default"
+	}
+
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_body", "Invalid request body", "无效的请求体")
+		return
+	}
+
+	password := strings.TrimSpace(req.Password)
+	if password == "" {
+		writeError(w, http.StatusUnauthorized, "password_required", "Password required", "密码不能为空")
+		return
+	}
+
+	if !s.tokenMatchesRoom(room, password) {
+		writeError(w, http.StatusUnauthorized, "wrong_password", "Wrong password", "密码不正确")
+		return
+	}
+
+	// 使用全局密码登录时，签发对所有房间有效的全局会话令牌
+	scope := ""
+	if globalPassword := normalizeAuthValue(s.config.Server.Auth); globalPassword != "" && password == globalPassword {
+		scope = "global"
+	}
+
+	token, err := s.issueRoomSessionToken(room, roomSessionTTLSeconds, scope)
+	if err != nil {
+		s.logger.Printf("错误: 签发房间会话令牌失败: %v", err)
+		writeError(w, http.StatusInternalServerError, "token_issue_failed", "Failed to issue token", "令牌签发失败")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token":     token,
+		"expiresAt": time.Now().Unix() + roomSessionTTLSeconds,
+		"scope":     scope,
+	})
+}
+
+// handleAuthTokenRefresh 使用仍有效的会话令牌签发新令牌，无需密码即可静默续期。
+func (s *ClipboardServer) handleAuthTokenRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed", "仅允许 POST 请求")
+		return
+	}
+
+	room := normalizeRoomName(r.URL.Query().Get("room"))
+	if room == "" {
+		room = "default"
+	}
+
+	token := extractAuthToken(r)
+	claims, ok := s.parseRoomSessionToken(token)
+	if !ok || !s.validateRoomSessionToken(room, token) {
+		writeError(w, http.StatusUnauthorized, "session_token_invalid", "Session token invalid or expired", "会话令牌无效或已过期")
+		return
+	}
+
+	// 续签时保留原令牌的 scope，避免全局会话降级为房间专属
+	newToken, err := s.issueRoomSessionToken(room, roomSessionTTLSeconds, claims.Scope)
+	if err != nil {
+		s.logger.Printf("错误: 续签房间会话令牌失败: %v", err)
+		writeError(w, http.StatusInternalServerError, "token_refresh_failed", "Failed to refresh token", "令牌续签失败")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token":     newToken,
+		"expiresAt": time.Now().Unix() + roomSessionTTLSeconds,
+		"scope":     claims.Scope,
+	})
+}
 
 func (s *ClipboardServer) handle_server(w http.ResponseWriter, r *http.Request) {
 	s.logger.Printf("处理 /server 请求，来自: %s", get_remote_ip(r))
@@ -23,9 +118,16 @@ func (s *ClipboardServer) handle_server(w http.ResponseWriter, r *http.Request) 
 	globalPassword := normalizeAuthValue(s.config.Server.Auth)
 	if _, hasRoom := r.URL.Query()["room"]; hasRoom {
 		room := r.URL.Query().Get("room")
-		authNeeded = s.resolveRoomAuth(room).Required
+		requirement := s.resolveRoomAuth(room)
+		authNeeded = requirement.Required
 		authorized = s.canAccessRoom(room, extractAuthToken(r))
-		roomProtected = s.hasRoomAuthEntry(room)
+		// ⚠️ `roomProtected` 的含义是「这个房间**实际要不要密码**」，不是「roomAuth 里
+		// 有没有这一项」。两者**不是一回事**：显式 `{open: true}` 的房间在配置里有这一项，
+		// 但不要密码；只写 `{automation: "single"}` 的条目同理。这里曾经用
+		// hasRoomAuthEntry，后果是 SPA 顶部那个房间 chip 给一个开放房间挂了一把锁
+		// （`/rooms` 的 isProtected 早就是按「要不要密码」算的，漏的就是这一处；
+		// Cloudflare 侧修过同一个 bug，见 workers/src/auth.js 里那段注释）。
+		roomProtected = requirement.Required
 	} else if globalPassword != "" {
 		authNeeded = true
 		authorized = s.canAccessRoom("default", extractAuthToken(r))
@@ -47,11 +149,14 @@ func (s *ClipboardServer) handle_server(w http.ResponseWriter, r *http.Request) 
 				"roomList": s.config.Server.RoomList,
 			},
 		},
+		// 定时自动化的能力声明。前端据此决定要不要渲染自动化面板 ——
+		// 唯一来源是这里，前端不要自己判断「这个房间有没有密码」（会和服务端策略漂开）。
+		"automation": s.AutomationCapability(r),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		s.logger.Printf("错误: 编码 /server 响应失败: %v", err)
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "encode_failed", "Failed to encode response", "Failed to encode response")
 	}
 }
 
@@ -63,21 +168,28 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 	requirement := s.resolveRoomAuth(room)
 	authNeeded := requirement.Required
 	if authNeeded {
-		token := extractAuthToken(r)
+		token := extractWebSocketToken(r)
 		if token == "" {
 			s.logger.Printf("WebSocket 认证失败: 未提供 token。来自 IP: %s, 房间: %s", ip, room)
-			http.Error(w, "Unauthorized: Missing token", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "unauthorized_missing_token", "Missing auth token", "Unauthorized: Missing token")
 			return
 		}
 		if !s.canAccessRoom(room, token) {
 			s.logger.Printf("WebSocket 认证失败: 提供的 token 与房间 '%s' 的认证配置不匹配。来自 IP: %s", room, ip)
-			http.Error(w, "Unauthorized: Invalid token", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "unauthorized_invalid_token", "Invalid auth token", "Unauthorized: Invalid token")
 			return
 		}
 		s.logger.Printf("WebSocket 认证成功。来自 IP: %s, 房间: %s", ip, room)
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// 回显客户端通过 Sec-WebSocket-Protocol 子协议提供的 token，避免 token 出现在 URL/访问日志中。
+	// 浏览器要求服务端必须回选一个子协议，否则握手会被判定失败。
+	respHeader := http.Header{}
+	if proto := r.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+		respHeader.Set("Sec-WebSocket-Protocol", strings.TrimSpace(strings.Split(proto, ",")[0]))
+	}
+
+	conn, err := upgrader.Upgrade(w, r, respHeader)
 	if err != nil {
 		s.logger.Printf("错误: WebSocket 升级失败: %v", err)
 		return
@@ -90,7 +202,8 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 	clientUA := s.parser.Parse(userAgent)
 	deviceMeta := DeviceMeta{
 		ID:      deviceID,
-		Type:    clientUA.Device.Family,
+		Type:    detectDeviceType(userAgent, clientUA.Os.Family),
+		Name:    resolveDeviceName(r),
 		Device:  strings.TrimSpace(fmt.Sprintf("%s %s %s", clientUA.Device.Brand, clientUA.Device.Model, clientUA.Os.Family)),
 		OS:      fmt.Sprintf("%s %s", clientUA.Os.Family, clientUA.Os.Major),
 		Browser: fmt.Sprintf("%s %s", clientUA.UserAgent.Family, clientUA.UserAgent.Major),
@@ -137,39 +250,35 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broadcastWebSocketMessageToRoomExcept(newDeviceClientMsg, room, conn)
 
-	// 第二次加锁：获取历史消息（短时间持锁）
-	var historyMessages []PostEvent
+	// 第二次加锁：**连接时刻该房间的最大 id**（短时间持锁）
+	//
+	// ⚠️★ **握手不再推历史了**（Jonny 2026-09-26：「没有老客户端，不用考虑老客户端」）。
+	// 历史改由客户端自己去 `GET /content` 拿，所以这里只需算 `latestId`，不必再攒一份
+	// 历史切片。原来那个 `?history=0` 开关也一并删掉 —— 默认就是不推，它与默认同义，
+	// 留着只会是一处会漂的冗余。
+	latestID := 0
 	s.messageQueue.Lock()
 	for _, msg := range s.messageQueue.List {
-		if msg.Data.Room() == "" || msg.Data.Room() == room {
-			historyMessages = append(historyMessages, msg)
+		if msg.Data.Room() != "" && msg.Data.Room() != room {
+			continue
+		}
+		if msg.Data.ID() > latestID {
+			latestID = msg.Data.ID()
 		}
 	}
 	s.messageQueue.Unlock() // 立即释放消息队列锁
 
-	// 发送历史消息（在锁外执行）
-	for _, msg := range historyMessages {
-		var clientPayload interface{}
-		if msg.Data.TextReceive != nil {
-			clientPayload = msg.Data.TextReceive
-		} else if msg.Data.FileReceive != nil {
-			clientPayload = msg.Data.FileReceive
-		} else {
-			continue
-		}
-
-		wsMsg := WebSocketMessage{
-			Event: "receive",
-			Data:  clientPayload,
-		}
-		if err := conn.WriteJSON(wsMsg); err != nil {
-			s.logger.Printf("错误: 发送历史消息到客户端 %s 失败: %v", conn.RemoteAddr(), err)
-			s.cleanupWebSocketConnection(conn, deviceID, room)
-			return
-		}
-	}
-	s.logger.Printf("已发送 %d 条历史消息到客户端 %s (房间: %s)", len(historyMessages), conn.RemoteAddr(), room)
-
+	// ⚠️★ **握手顺序是契约，不是碰巧**（`docs/specs/ws-live-only.md` §2.2）：
+	//
+	//	① connect × N（房间里已有的设备）
+	//	② connect 广播（告诉其他人「我来了」）
+	//	③ config（`app.config` 的唯一来源，**带 `latestId`**）
+	//	之后才是实时消息。
+	//
+	// ⚠️ **`config` 必须排在实时之前** —— 客户端在拿到 `config.latestId` 之前
+	// **一条都不该写剪贴板**（它要用那个 id 对齐「HTTP 取回的历史」与「WS 推来的实时」）。
+	// 别为了首屏快一点把 `config` 挪到后面去。
+	//
 	// 发送配置信息给新连接的客户端
 	clientConfigData := struct {
 		Version string `json:"version"`
@@ -187,6 +296,37 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 			Limit  int `json:"limit"`
 		} `json:"file"`
 		Auth bool `json:"auth"`
+		// LatestID 是**连接时刻该房间的最大消息 id**（没有消息时 0）。
+		//
+		// ⚠️★ **它现在的职责**：客户端连上后是**自己去 `GET /content` 拿历史**的，
+		// 而「HTTP 取历史」与「WS 收实时」之间有个**时序窗口** —— 请求返回之前
+		// 可能已经推来几条实时消息。有了 `latestId`，客户端才能对齐那条边界：
+		// `id <= latestId` 只当历史认领（**不写剪贴板**），`id > latestId` 才是实时。
+		// 少了它，边界上的消息会被处理两次（或把历史灌进剪贴板）。
+		//
+		// ⚠️ 它**兼作能力探测信号**：老后端（没有 `/content` 这条路由、也就没这个字段）
+		// 不下发它，新客户端据此退回「靠 WS 推历史」的老路 —— 见
+		// `docs/specs/ws-live-only.md` §0.4（用户自己部署的那份 Worker 我们管不着）。
+		//
+		// ⚠️★ 它**必须在 WebSocket 握手载荷里**，**不是** `/server` 的 HTTP 响应 ——
+		// `config` 是前端 `app.config` 的**唯一来源**。加错地方会得到一个永远
+		// `undefined` 的字段，而这个坑**已经踩过两次**（`automation.enabled`、`prefix`）。
+		LatestID int `json:"latestId"`
+		// Automation 只给**开关**，不给完整能力（tier / max / actions / vars 那些在
+		// `/server` 和管理页自己的 `/tasks` 响应里）。
+		//
+		// ⚠️ 为什么必须有它：SPA 工具栏上那个「定时任务」入口要按「**这个后端支不支持**」
+		// 决定渲不渲染。Cloudflare Worker 部署没有这一族接口，无条件渲染的话点下去会被
+		// SPA 兜底吞掉 —— 用户看到的是「点了定时任务、回到了首页」，和当初被 Service
+		// Worker 吞掉那次同一个症状。
+		//
+		// ⚠️ 前端的 `app.config` 来自**这条 config 事件**，不是 `/server` 的 HTTP 响应
+		// （见 store/websocket.js 的 handleEvent('config')）。所以能力开关必须在这里下发 ——
+		// 只在 `/server` 里加、前端却读 app.config，会得到一个永远为 undefined 的字段，
+		// 表现就是入口在**所有**部署下都不显示。
+		Automation struct {
+			Enabled bool `json:"enabled"`
+		} `json:"automation"`
 	}{
 		Version: server_version,
 		Server: struct {
@@ -198,9 +338,13 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 			Prefix:   s.config.Server.Prefix,
 			RoomList: s.config.Server.RoomList,
 		},
-		Text: s.config.Text,
-		File: s.config.File,
-		Auth: authNeeded,
+		Text:     s.config.Text,
+		File:     s.config.File,
+		Auth:     authNeeded,
+		LatestID: latestID,
+		Automation: struct {
+			Enabled bool `json:"enabled"`
+		}{Enabled: s.automationEnabled()},
 	}
 
 	configWsMsg := WebSocketMessage{
@@ -217,6 +361,38 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer s.cleanupWebSocketConnection(conn, deviceID, room)
 
+		done := make(chan struct{})
+		defer close(done)
+
+		var lastPingNano int64 // 原子访问；0 表示当前无待确认的 ping
+
+		// 设置 pong 处理，测量局域网 RTT
+		conn.SetPongHandler(func(appData string) error {
+			nanos := atomic.SwapInt64(&lastPingNano, 0)
+			if nanos != 0 {
+				rtt := float64(time.Now().UnixNano()-nanos) / float64(time.Millisecond)
+				s.latency.add(rtt)
+			}
+			return nil
+		})
+
+		// 定期发送 ping 以计算延迟
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					atomic.StoreInt64(&lastPingNano, time.Now().UnixNano())
+					if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(2*time.Second)); err != nil {
+						return
+					}
+				}
+			}
+		}()
+
 		for {
 			messageType, p, err := conn.ReadMessage()
 			if err != nil {
@@ -228,6 +404,17 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if len(p) > 0 {
+				// Web 端延迟测量: 客户端发送 {"event":"ping","data":<clientMs>},
+				// 这里原样回显 data, 客户端用 (Date.now()-data) 计算 RTT。
+				var pingMsg WebSocketMessage
+				if json.Unmarshal(p, &pingMsg) == nil && pingMsg.Event == "ping" {
+					if t, ok := pingMsg.Data.(float64); ok {
+						if err := conn.WriteJSON(WebSocketMessage{Event: "pong", Data: t}); err != nil {
+							return
+						}
+						continue
+					}
+				}
 				s.logger.Printf("收到来自 %s (ID: %s) 的 WebSocket 心跳消息: 类型 %d, 内容: %s",
 					conn.RemoteAddr(), deviceID, messageType, string(p))
 			}
@@ -249,19 +436,20 @@ func (s *ClipboardServer) handle_file(w http.ResponseWriter, r *http.Request) {
 
 	if !ok {
 		s.logger.Printf("文件未找到或已过期: %s", uuid)
-		http.Error(w, "文件未找到或已过期", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "file_not_found", "File not found or expired", "文件未找到或已过期")
 		return
 	}
 
 	// 检查文件是否已过期 (双重检查，因为 cleanExpiredFilesLoop 是异步的)
-	if fileInfo.ExpireTime < time.Now().Unix() {
+	// ExpireTime <= 0 表示永不过期
+	if fileInfo.ExpireTime > 0 && fileInfo.ExpireTime < time.Now().Unix() {
 		s.logger.Printf("尝试访问已过期的文件: %s (UUID: %s)", fileInfo.Name, uuid)
 		// 从 map 中移除并尝试删除文件
 		s.runMutex.Lock()
 		delete(s.uploadFileMap, uuid)
 		s.runMutex.Unlock()
 		go os.Remove(filepath.Join(s.storageFolder, uuid)) // 异步删除
-		http.Error(w, "文件已过期", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "file_expired", "File expired", "文件已过期")
 		return
 	}
 
@@ -274,7 +462,7 @@ func (s *ClipboardServer) handle_file(w http.ResponseWriter, r *http.Request) {
 		file, err := os.Open(filePath) // 打开文件以供 ServeContent 使用
 		if err != nil {
 			s.logger.Printf("错误: 打开文件失败: %v", err)
-			http.Error(w, "文件在磁盘上未找到", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "file_missing_on_disk", "File missing on disk", "文件在磁盘上未找到")
 			return
 		}
 		defer file.Close()
@@ -282,7 +470,7 @@ func (s *ClipboardServer) handle_file(w http.ResponseWriter, r *http.Request) {
 		stat, err := file.Stat()
 		if err != nil {
 			s.logger.Printf("错误: 获取文件状态失败: %v", err)
-			http.Error(w, "无法获取文件状态", http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "file_stat_failed", "Cannot read file info", "无法获取文件状态")
 			return
 		}
 
@@ -304,7 +492,7 @@ func (s *ClipboardServer) handle_file(w http.ResponseWriter, r *http.Request) {
 		err := os.Remove(filePath)
 		if err != nil && !os.IsNotExist(err) {
 			s.logger.Printf("错误: 删除文件失败: %v", err)
-			http.Error(w, "删除文件失败", http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "file_delete_failed", "Failed to delete file", "删除文件失败")
 			return
 		}
 
@@ -318,30 +506,153 @@ func (s *ClipboardServer) handle_file(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": "文件删除成功"})
 
 	default:
-		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "方法不允许")
 	}
+}
+
+// readTextBody 从请求体里取正文。只认两种结构化形态，**其余一律当纯文本**：
+//
+//	· application/json       → {"content": "..."}
+//	· multipart/form-data    → 表单字段 content
+//	· 其它（含不声明、含 urlencoded） → 整个请求体就是正文（老客户端全走这条）
+//
+// ⚠️ **`application/x-www-form-urlencoded` 刻意不认**。它是 `curl --data-binary` 之类
+// 不带 `-H` 时的**默认** Content-Type，很多老调用方（含本仓库的 e2e 灌数据）都这样发正文；
+// 一旦把它当表单解析，`# 标题\n- 一条` 这种没有 `=` 的正文会解析出**空的 content 字段** ——
+// 不是报错，是**静默存成空串**。宁可不认它，让这些请求继续走「整个 body 是正文」那条老路。
+//
+// 为什么要有前两条：快捷指令用「获取 URL 内容」把**字符串变量**当请求体发出去时，
+// 字节会变成 UTF-16（服务端收到的是 `j\0u\0s\0t\0`），而**结构化请求体**（JSON / 表单）
+// 是按 UTF-8 序列化的。所以捷径侧只要把请求体类型从「文件」换成这两个之一，
+// 编码问题就不存在了 —— 前提是服务端这边先收得下。
+//
+// 顺带记一笔（2026-09-22 实测）：那条捷径现在为了绕开编码问题，把正文过了一道
+// 「从多信息文本获取 Markdown」。而那个动作是**富文本 → markdown 的转换器**，
+// 会把 markdown 里有意义的字符转义掉（`- 一条` 变成 `\- 一条`，就是用户看到的「多 `\`」），
+// 对纯文本还会直接返回空串。走 JSON / 表单之后那一步可以整个删掉。
+func readTextBody(r *http.Request) (string, error) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		// Content-Type 写坏了（或不认识）就当老客户端处理 —— 整个 body 是正文
+		mediaType = ""
+	}
+
+	switch mediaType {
+	case "application/json":
+		var payload struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			return "", fmt.Errorf("JSON 正文解析失败: %w", err)
+		}
+		return payload.Content, nil
+
+	case "multipart/form-data":
+		// 4MB 走内存、超出落临时文件。一条文本远够用。
+		if err := r.ParseMultipartForm(4 << 20); err != nil {
+			return "", fmt.Errorf("表单正文解析失败: %w", err)
+		}
+		// 用 PostFormValue 而不是 FormValue：后者会回落到查询串，
+		// 于是 `?content=xx` 会**悄悄覆盖**表单里的正文。
+		return r.PostFormValue("content"), nil
+
+	default:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return "", err
+		}
+		// ⚠️ 别直接 string(body)：捷径发出来的字节可能是 UTF-16 —— 见 decodeTextBytes
+		return decodeTextBytes(body), nil
+	}
+}
+
+// decodeTextBytes 把请求体的字节还原成字符串。
+//
+// 为什么需要它：**快捷指令把字符串变量当请求体发出去时，字节是 UTF-16**
+// （能直接看到 `A\x00B\x00C\x00` 这种「字符后跟 NUL」的模式）。服务端一直按 UTF-8 读，
+// 于是中英文一起变乱码。客户端那边为了绕开它做过各种转换动作，而每一种都有自己的副作用 ——
+// 「从多信息文本获取 Markdown」就会把正文里的 markdown 字符转义掉（`- 一条` → `\- 一条`）。
+//
+// 这里只做一件事：**认出 UTF-16 就解码**，认不出原样当 UTF-8。三个信号依次看：
+//
+//	① BOM（FF FE / FE FF）—— 最可靠，见到就认；
+//	② 隔位 NUL —— ASCII 为主的正文编成 UTF-16 后每个字符后面跟一个 NUL；
+//	③ 整段不是合法 UTF-8、但按 UTF-16LE 解出来没有替换字符 —— 中文为主的正文靠这条
+//	   （CJK 在 UTF-16 里不含 NUL，②对它完全无感）。
+//
+// 误判风险：一段**合法 UTF-8** 永远不会走到 ③；而 GBK 之类解成 UTF-16 会满是替换字符，
+// 也过不了 ③。所以宁可漏认，不会把好好的 UTF-8 弄坏。
+func decodeTextBytes(b []byte) string {
+	if len(b) >= 2 {
+		if b[0] == 0xFF && b[1] == 0xFE {
+			return decodeUTF16(b[2:], binary.LittleEndian)
+		}
+		if b[0] == 0xFE && b[1] == 0xFF {
+			return decodeUTF16(b[2:], binary.BigEndian)
+		}
+	}
+
+	if len(b) >= 4 && len(b)%2 == 0 {
+		evenZeros, oddZeros := 0, 0
+		for i, c := range b {
+			if c == 0 {
+				if i%2 == 0 {
+					evenZeros++
+				} else {
+					oddZeros++
+				}
+			}
+		}
+		// ② 隔位 NUL：一半以上的奇数位是 NUL 且偶数位没有 NUL → 小端
+		if oddZeros >= len(b)/4 && evenZeros == 0 {
+			return decodeUTF16(b, binary.LittleEndian)
+		}
+		if evenZeros >= len(b)/4 && oddZeros == 0 {
+			return decodeUTF16(b, binary.BigEndian)
+		}
+		// ③ 不是合法 UTF-8，但按 UTF-16LE 解得干净 → 认它
+		if !utf8.Valid(b) {
+			if s := decodeUTF16(b, binary.LittleEndian); !strings.ContainsRune(s, utf8.RuneError) {
+				return s
+			}
+		}
+	}
+
+	return string(b)
+}
+
+func decodeUTF16(b []byte, order binary.ByteOrder) string {
+	units := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		units = append(units, order.Uint16(b[i:i+2]))
+	}
+	// 末尾常带一个孤立的 NUL（发出去的字符串结尾），去掉它别在正文尾巴上多一个字符
+	if n := len(units); n > 0 && units[n-1] == 0 {
+		units = units[:n-1]
+	}
+	return string(utf16.Decode(units))
 }
 
 func (s *ClipboardServer) handle_text(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "仅允许 POST 请求", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed", "仅允许 POST 请求")
 		return
 	}
 
 	room := normalizeRoomName(r.URL.Query().Get("room"))
 
-	body, err := io.ReadAll(r.Body)
+	// 正文可以是纯文本、JSON 或表单 —— 见 readTextBody 上面那段说明
+	text, err := readTextBody(r)
 	if err != nil {
-		s.logger.Printf("错误: 读取 /text 请求体失败: %v", err)
-		http.Error(w, "无法读取请求体", http.StatusInternalServerError)
+		// 解析失败（JSON 写坏了 / 表单坏了）比 IO 失败常见得多，统一按「请求体不合法」回 400
+		s.logger.Printf("错误: 解析 /text 请求体失败: %v", err)
+		writeError(w, http.StatusBadRequest, "invalid_body", "Cannot parse request body", "请求体无法解析")
 		return
 	}
 	defer r.Body.Close()
-
-	text := string(body)
 	if s.config.Text.Limit > 0 && len(text) > s.config.Text.Limit {
 		s.logger.Printf("错误: 文本内容超出限制 (%d > %d)", len(text), s.config.Text.Limit)
-		http.Error(w, fmt.Sprintf("文本内容超出限制 (最大 %d 字符)", s.config.Text.Limit), http.StatusRequestEntityTooLarge)
+		writeError(w, http.StatusRequestEntityTooLarge, "text_too_long", "Text too long", fmt.Sprintf("文本内容超出限制 (最大 %d 字符)", s.config.Text.Limit))
 		return
 	}
 
@@ -352,7 +663,7 @@ func (s *ClipboardServer) handle_text(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			s.logger.Printf("无效的 ID 参数: %s", idStr)
-			http.Error(w, "无效的 ID 参数", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "invalid_id", "Invalid id parameter", "无效的 ID 参数")
 			return
 		}
 
@@ -373,7 +684,7 @@ func (s *ClipboardServer) handle_text(w http.ResponseWriter, r *http.Request) {
 			return
 		} else {
 			s.logger.Printf("未找到可更新的文本消息 ID: %d (房间: %s)", id, room)
-			http.Error(w, "消息未找到或无法更新", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "message_not_updatable", "Message not found or not updatable", "消息未找到或无法更新")
 			return
 		}
 	}
@@ -416,7 +727,7 @@ func (s *ClipboardServer) updateTextMessage(id int, newContent string, room stri
 				s.messageQueue.List[i].Data.TextReceive.Content = newContent
 				s.messageQueue.List[i].Data.TextReceive.Timestamp = time.Now().Unix()
 				s.messageQueue.List[i].Data.TextReceive.SenderIP = get_remote_ip(r)
-				s.messageQueue.List[i].Data.TextReceive.SenderDevice = s.parse_user_agent(r.UserAgent())
+				s.messageQueue.List[i].Data.TextReceive.SenderDevice = s.parse_user_agent(r.UserAgent(), resolveDeviceName(r))
 
 				// 广播更新事件
 				wsMsg := WebSocketMessage{
@@ -426,7 +737,7 @@ func (s *ClipboardServer) updateTextMessage(id int, newContent string, room stri
 				go s.broadcastWebSocketMessage(wsMsg, room)
 
 				// 保存历史数据
-				go s.saveHistoryData()
+				s.saveHistoryAsync()
 
 				s.logger.Printf("文本消息 ID %d 已更新 (房间: %s) - 原内容: '%s', 新内容: '%s'", id, room, originalContent, newContent)
 				return true
@@ -436,9 +747,102 @@ func (s *ClipboardServer) updateTextMessage(id int, newContent string, room stri
 	return false
 }
 
+// 看板的列。**固定三列**，不做用户自建 —— 这是最小实现，见 handleContentColumn。
+var boardColumns = map[string]bool{"todo": true, "doing": true, "done": true}
+
+// normalizeBoardColumn 校验列名。空串归一成 todo（新条目默认落在待办）。
+func normalizeBoardColumn(raw string) (string, bool) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return "todo", true
+	}
+	if boardColumns[value] {
+		return value, true
+	}
+	return "", false
+}
+
+// handleContentColumn 把一条内容挪到看板的某一列：`POST /content/<id>/column`。
+//
+// 看板的最小实现：**固定三列**（todo / doing / done），卡片就是剪贴板条目本身 ——
+// 不建新表、不做「列内顺序」，条目上多一个 `column` 字段就够了（空 = 待办）。
+// 列是**视图属性**：所有模式看的是同一批条目，只是看板按列摆。
+//
+// ⚠️ **故意不动 timestamp**。`updateTextMessage` 改正文时会把时间戳刷成现在，
+// 但「把卡片挪到另一列」不该让它在时间流里跳到最前面 —— 挪个位置就重排整个列表太突然。
+func (s *ClipboardServer) handleContentColumn(w http.ResponseWriter, r *http.Request, idStr string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed", "仅允许 POST 请求")
+		return
+	}
+
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_content_id", "Invalid content id", "无效的内容 ID")
+		return
+	}
+
+	var body struct {
+		Column string `json:"column"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "Invalid JSON body", "请求体不是合法的 JSON")
+		return
+	}
+	column, columnOK := normalizeBoardColumn(body.Column)
+	if !columnOK {
+		writeError(w, http.StatusBadRequest, "invalid_column", "Unknown board column", "未知的看板列（只支持 todo / doing / done）")
+		return
+	}
+
+	_, hasRequestedRoom := r.URL.Query()["room"]
+	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
+
+	s.messageQueue.Lock()
+	defer s.messageQueue.Unlock()
+
+	for i, msg := range s.messageQueue.List {
+		if msg.Data.ID() != id {
+			continue
+		}
+		messageRoom := normalizeRoomName(msg.Data.Room())
+		if hasRequestedRoom && messageRoom != requestedRoom {
+			continue
+		}
+		// 与 handleContent 同一条鉴权：按**条目自己记录的房间**，不信客户端传的 ?room=
+		if !s.canAccessContent(r, messageRoom, id) {
+			writeError(w, http.StatusUnauthorized, "room_auth_required", "Room authentication required", "无权访问该房间")
+			return
+		}
+
+		s.messageQueue.List[i].Data.SetColumn(column)
+
+		// 广播载荷要和 updateTextMessage 一致：客户端 `case 'update'` 是
+		// `{...app.received[i], ...data}` 原地合并，所以给**具体那一支**（含 id），不是外层 holder。
+		var payload interface{}
+		if msg.Data.TextReceive != nil {
+			payload = s.messageQueue.List[i].Data.TextReceive
+		} else {
+			payload = s.messageQueue.List[i].Data.FileReceive
+		}
+		go s.broadcastWebSocketMessage(WebSocketMessage{Event: "update", Data: payload}, messageRoom)
+		s.saveHistoryAsync()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"id":     strconv.Itoa(id),
+			"type":   msg.Data.Type(),
+			"column": column,
+		})
+		return
+	}
+
+	writeError(w, http.StatusNotFound, "content_not_found", "Content not found", "内容未找到")
+}
+
 func (s *ClipboardServer) handle_upload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "仅允许 POST 请求", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed", "仅允许 POST 请求")
 		return
 	}
 
@@ -454,7 +858,7 @@ func (s *ClipboardServer) handle_upload(w http.ResponseWriter, r *http.Request) 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			s.logger.Printf("错误: 读取文件名失败: %v", err)
-			http.Error(w, "无法读取请求体", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "body_read_failed", "Cannot read request body", "无法读取请求体")
 			return
 		}
 		defer r.Body.Close()
@@ -464,7 +868,13 @@ func (s *ClipboardServer) handle_upload(w http.ResponseWriter, r *http.Request) 
 		s.logger.Printf("初始化分块上传: %s, 生成UUID: %s", filename, uuid)
 
 		// 创建文件信息直接记录到 uploadFileMap 中
-		expireTime := time.Now().Unix() + int64(s.config.File.Expire)
+		// 房间级 fileExpire 覆盖全局 file.expire（0=永不过期）
+		var expireTime int64
+		if expireSeconds := s.resolveFileExpireSeconds(room); expireSeconds > 0 {
+			expireTime = time.Now().Unix() + expireSeconds
+		} else {
+			expireTime = 0
+		}
 		s.runMutex.Lock()
 		s.uploadFileMap[uuid] = File{
 			Name:       filename,
@@ -488,21 +898,21 @@ func (s *ClipboardServer) handle_upload(w http.ResponseWriter, r *http.Request) 
 	// 检查文件大小限制
 	if s.config.File.Limit > 0 && r.ContentLength > int64(s.config.File.Limit) {
 		s.logger.Printf("错误: 文件大小 (%d) 超出限制 (%d)", r.ContentLength, s.config.File.Limit)
-		http.Error(w, fmt.Sprintf("文件大小超出限制 (最大 %d 字节)", s.config.File.Limit), http.StatusRequestEntityTooLarge)
+		writeError(w, http.StatusRequestEntityTooLarge, "file_too_large", "File too large", fmt.Sprintf("文件大小超出限制 (最大 %d 字节)", s.config.File.Limit))
 		return
 	}
 
 	err := r.ParseMultipartForm(int64(s.config.File.Limit)) // 使用文件大小限制作为 maxMemory
 	if err != nil {
 		s.logger.Printf("错误: 解析 multipart form 失败: %v", err)
-		http.Error(w, "无法解析表单数据", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "form_parse_failed", "Cannot parse form data", "无法解析表单数据")
 		return
 	}
 
 	file, handler, err := r.FormFile("file") // "file" 是表单字段名
 	if err != nil {
 		s.logger.Printf("错误: 获取上传文件失败: %v", err)
-		http.Error(w, "无法获取文件", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "file_field_missing", "Cannot read uploaded file", "无法获取文件")
 		return
 	}
 	defer file.Close()
@@ -519,19 +929,25 @@ func (s *ClipboardServer) handle_upload(w http.ResponseWriter, r *http.Request) 
 	dst, err := os.Create(filePath)
 	if err != nil {
 		s.logger.Printf("错误: 创建文件 %s 失败: %v", filePath, err)
-		http.Error(w, "无法保存文件", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "file_save_failed", "Cannot save file", "无法保存文件")
 		return
 	}
 	defer dst.Close()
 
 	if _, err := io.Copy(dst, file); err != nil {
 		s.logger.Printf("错误: 写入文件 %s 失败: %v", filePath, err)
-		http.Error(w, "无法写入文件", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "file_write_failed", "Cannot write file", "无法写入文件")
 		return
 	}
 
 	timestamp := time.Now().Unix()
-	expireTime := timestamp + int64(s.config.File.Expire)
+	// 房间级 fileExpire 覆盖全局 file.expire（0=永不过期）
+	var expireTime int64
+	if expireSeconds := s.resolveFileExpireSeconds(room); expireSeconds > 0 {
+		expireTime = timestamp + expireSeconds
+	} else {
+		expireTime = 0
+	}
 
 	// 创建文件信息
 	fileInfo := File{
@@ -585,7 +1001,7 @@ func (s *ClipboardServer) handle_upload(w http.ResponseWriter, r *http.Request) 
 
 func (s *ClipboardServer) handle_chunk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "仅允许 POST 请求", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed", "仅允许 POST 请求")
 		return
 	}
 
@@ -599,7 +1015,7 @@ func (s *ClipboardServer) handle_chunk(w http.ResponseWriter, r *http.Request) {
 
 	if !ok {
 		s.logger.Printf("错误: 无效的 UUID: %s", uuid)
-		http.Error(w, "无效的 UUID", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_uuid", "Invalid UUID", "无效的 UUID")
 		return
 	}
 
@@ -607,7 +1023,7 @@ func (s *ClipboardServer) handle_chunk(w http.ResponseWriter, r *http.Request) {
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		s.logger.Printf("错误: 读取分块数据失败: %v", err)
-		http.Error(w, "无法读取分块数据", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "chunk_read_failed", "Cannot read chunk data", "无法读取分块数据")
 		return
 	}
 	defer r.Body.Close()
@@ -619,7 +1035,7 @@ func (s *ClipboardServer) handle_chunk(w http.ResponseWriter, r *http.Request) {
 	// 检查文件大小是否超过限制
 	if s.config.File.Limit > 0 && newSize > int64(s.config.File.Limit) {
 		s.logger.Printf("错误: 文件大小已超过限制 (%d > %d)", newSize, s.config.File.Limit)
-		http.Error(w, fmt.Sprintf("文件大小已超过限制 (最大 %d 字节)", s.config.File.Limit), http.StatusRequestEntityTooLarge)
+		writeError(w, http.StatusRequestEntityTooLarge, "file_too_large", "File too large", fmt.Sprintf("文件大小已超过限制 (最大 %d 字节)", s.config.File.Limit))
 		return
 	}
 
@@ -634,14 +1050,14 @@ func (s *ClipboardServer) handle_chunk(w http.ResponseWriter, r *http.Request) {
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		s.logger.Printf("错误: 打开文件 %s 失败: %v", filePath, err)
-		http.Error(w, "无法打开文件", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "file_open_failed", "Cannot open file", "无法打开文件")
 		return
 	}
 	defer file.Close()
 
 	if _, err := file.Write(data); err != nil {
 		s.logger.Printf("错误: 写入数据到文件 %s 失败: %v", filePath, err)
-		http.Error(w, "无法写入文件", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "file_write_failed", "Cannot write file", "无法写入文件")
 		return
 	}
 
@@ -652,7 +1068,7 @@ func (s *ClipboardServer) handle_chunk(w http.ResponseWriter, r *http.Request) {
 
 func (s *ClipboardServer) handle_finish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "仅允许 POST 请求", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed", "仅允许 POST 请求")
 		return
 	}
 
@@ -668,7 +1084,7 @@ func (s *ClipboardServer) handle_finish(w http.ResponseWriter, r *http.Request) 
 
 	if !ok {
 		s.logger.Printf("错误: 无效的 UUID: %s", uuid)
-		http.Error(w, "无效的 UUID", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_uuid", "Invalid UUID", "无效的 UUID")
 		return
 	}
 
@@ -687,7 +1103,7 @@ func (s *ClipboardServer) handle_finish(w http.ResponseWriter, r *http.Request) 
 			Room:         room,
 			Timestamp:    timestamp,
 			SenderIP:     get_remote_ip(r),
-			SenderDevice: s.parse_user_agent(r.UserAgent()),
+			SenderDevice: s.parse_user_agent(r.UserAgent(), resolveDeviceName(r)),
 		},
 		Name:   fileInfo.Name,
 		Size:   fileInfo.Size,
@@ -729,13 +1145,13 @@ func (s *ClipboardServer) handle_finish(w http.ResponseWriter, r *http.Request) 
 func (s *ClipboardServer) handle_revoke(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 1 {
-		http.Error(w, "无效的撤销路径", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_revoke_path", "Invalid revoke path", "无效的撤销路径")
 		return
 	}
 	idStr := parts[len(parts)-1]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
-		http.Error(w, "无效的撤销 ID", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_revoke_id", "Invalid revoke id", "无效的撤销 ID")
 		return
 	}
 
@@ -770,11 +1186,11 @@ func (s *ClipboardServer) handle_revoke(w http.ResponseWriter, r *http.Request) 
 	s.messageQueue.Unlock()
 	if foundIndex == -1 {
 		if unauthorized {
-			writeAuthJSONError(w, http.StatusUnauthorized, "无权访问该房间")
+			writeError(w, http.StatusUnauthorized, "room_forbidden", "No access to this room", "无权访问该房间")
 			return
 		}
 		s.logger.Printf("尝试撤销未找到的消息 ID: %d", id)
-		http.Error(w, "消息未找到", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "message_not_found", "Message not found", "消息未找到")
 		return
 	}
 
@@ -807,7 +1223,7 @@ func (s *ClipboardServer) handle_revoke(w http.ResponseWriter, r *http.Request) 
 func (s *ClipboardServer) handleClearAll(w http.ResponseWriter, r *http.Request) {
 	normalizedRoom := normalizeRoomName(r.URL.Query().Get("room"))
 	if !s.canAccessRoom(normalizedRoom, extractAuthToken(r)) {
-		writeAuthJSONError(w, http.StatusUnauthorized, "无权访问该房间")
+		writeError(w, http.StatusUnauthorized, "room_forbidden", "No access to this room", "无权访问该房间")
 		return
 	}
 
@@ -860,41 +1276,117 @@ func (s *ClipboardServer) handleClearAll(w http.ResponseWriter, r *http.Request)
 	fmt.Fprintln(w, "所有消息已清除")
 }
 
+// writeError 是所有错误响应的唯一出口：一律返回 JSON。
+//
+// 三个字段各有分工，别混用：
+//
+//	code    机器码，snake_case，给程序判断用（前端据此分支、测试据此断言）。
+//	        一旦发布就不要改，改了等于破坏契约。
+//	error   英文人话，给「会看英文的人」和日志用。与 Worker 侧保持同一风格。
+//	message 中文人话，给人看。已分发的捷径、Android 快捷方式、前端都在展示它。
+//
+// 为什么需要它：Apple 快捷指令的「获取URL内容」**不暴露 HTTP 状态码**，只能读响应体，
+// 而它用 getDictionary 解析。纯文本错误会让它解析不出字段，走到兜底分支；
+// 更糟的是文件分支会拿错误文本去 setName + saveFilePrompt，
+// **保存出一个顶着原文件名的假文件**。
+//
+// 为什么不再按 Accept 分叉（曾经的做法，已废弃）：捷径根本不发 Accept 头，
+// 于是「文本超限」这类错误仍然是纯文本 —— 捷径读不到 error，把 413 误报成
+// 「服务器未确认保存，请检查部署地址及服务器状态」，把人往部署/网络方向带。
+// 同一状态码对应两种响应体形状，等于要求每个客户端各写两套解析逻辑。
+// 统一成 JSON 后客户端只需要一套。
+func writeError(w http.ResponseWriter, status int, code, errText, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{
+		"code":    code,
+		"error":   errText,
+		"message": message,
+	})
+}
+
+// resolveContentFormat 读**显式**的格式信号：只有 `?format=` 一个。
+//
+// ⚠️ 2026-09-26：**`.json` 路径后缀已经删掉了**（Jonny：「那个 .json 路径后缀也下线，
+// 文档同步更新」）。它挂了很久的「即将下线」牌子，而**这个项目没有老用户** ——
+// 兼容垫片是永久成本，见 `CONTRIBUTING.md` §0 那一族约定。
+//
+// ⚠️ **`?json=1` 暂时保留**（同日 Jonny：「只删 .json，其它暂时保留」）—— 它和刚删掉的
+// 后缀是同一族兼容信号，但这次只下线后缀。所以别把这一支也顺手删了。
+//
+// 返回 "" 表示调用方没显式要格式，由分支自己决定（文本分支会再看 Accept 头，
+// 文件分支不看 —— 见 wantsJSON 的注释）。
+//
+// 第二个返回值 false 表示 format 给了不认识的值（比如 ?format=html）：必须报错、
+// 不能回落，否则客户端以为拿到 HTML、实际拿到原文。
+func resolveContentFormat(r *http.Request) (string, bool) {
+	if explicit := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format"))); explicit != "" {
+		switch explicit {
+		case "json":
+			return "json", true
+		case "raw", "text", "plain":
+			return "raw", true
+		default:
+			return "", false
+		}
+	}
+	if v := r.URL.Query().Get("json"); v == "true" || v == "1" {
+		return "json", true
+	}
+	return "", true
+}
+
+// wantsJSON 决定**文本**响应给不给 JSON：显式格式优先，没显式时才看 Accept 头。
+//
+// 文件分支不走这里。下载链路上的 Accept 头太不可靠（浏览器、下载器、脚本五花八门），
+// 所以文件分支历来只认显式信号 —— 这是既有设计，别为了「统一」合并掉：
+// 合并的后果是「浏览器直接点开文件链接」会突然收到一坨 JSON。
+func wantsJSON(explicitFormat string, r *http.Request) bool {
+	switch explicitFormat {
+	case "json":
+		return true
+	case "raw":
+		return false
+	default:
+		return strings.Contains(r.Header.Get("Accept"), "application/json")
+	}
+}
+
 func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 2 { // 至少需要 "content" 和 id
-		http.Error(w, "无效的内容路径", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_content_path", "Invalid content path", "无效的内容路径")
+		return
+	}
+
+	// /content/<id>/column —— 看板把卡片挪到另一列。必须先分派：下面按「最后一段是 id」
+	// 取 id，`/content/7/column` 会被当成 id="column" 然后 Atoi 失败。
+	if len(parts) == 3 && parts[2] == "column" {
+		s.handleContentColumn(w, r, parts[1])
 		return
 	}
 
 	idStr := parts[len(parts)-1]
 
 	// 检查是否是访问 "latest"，如果是，让专用处理函数处理
-	if idStr == "latest" || idStr == "latest.json" {
+	if idStr == "latest" {
 		s.handleLatestContent(w, r)
 		return
 	}
-	// 检查是否请求 JSON 格式的响应
-	// 1. 通过 URL 后缀判断
-	isJSONRequest := strings.HasSuffix(idStr, ".json")
-	// 如果 idStr 带有 .json 后缀，需要去除后缀再转换为整数
-	if isJSONRequest {
-		idStr = strings.TrimSuffix(idStr, ".json")
+	explicitFormat, formatOK := resolveContentFormat(r)
+	if !formatOK {
+		writeError(w, http.StatusBadRequest, "unsupported_format", "Unsupported format", "不支持的格式（只支持 raw / json）")
+		return
 	}
-	// 2. 通过查询参数判断 (json=true 或 json=1)
-	jsonParam := r.URL.Query().Get("json")
-	if jsonParam == "true" || jsonParam == "1" {
-		isJSONRequest = true
-	}
-	// 3. 通过 Accept 头判断 (会在特定情况下检查)
+	// 文件分支只看显式信号；文本分支还会看 Accept（见下方 wantsJSON）
+	isJSONRequest := explicitFormat == "json"
 
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		s.logger.Printf("无效的内容 ID: %s, 错误: %v", idStr, err)
-		http.Error(w, "无效的内容 ID", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_content_id", "Invalid content id", "无效的内容 ID")
 		return
 	}
-	token := extractAuthToken(r)
 	_, hasRequestedRoom := r.URL.Query()["room"]
 	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
 	s.logger.Printf("处理内容请求, ID: %d, 房间参数存在: %t, JSON请求: %t", id, hasRequestedRoom, isJSONRequest)
@@ -911,7 +1403,8 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 			if hasRequestedRoom && messageRoom != requestedRoom {
 				continue
 			}
-			if !s.canAccessRoom(messageRoom, token) {
+			// 房间密码 或 针对该 content 的短期分享 token
+			if !s.canAccessContent(r, messageRoom, id) {
 				unauthorized = true
 				continue
 			}
@@ -923,17 +1416,18 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 					if isJSONRequest {
 						// 返回JSON格式的文件信息
 						fileReceive := msg.Data.FileReceive
-						responseType := DetermineResponseType(fileReceive.Name)
 
-						responseData := map[string]interface{}{
-							"type":      responseType,
-							"name":      fileReceive.Name,
-							"size":      fileReceive.Size,
-							"uuid":      fileReceive.Cache,
-							"url":       fileReceive.URL,
-							"id":        strconv.Itoa(msg.Data.ID()),
-							"timestamp": fileReceive.Timestamp,
+						// 过期检查必须放在返回之前：否则客户端会拿着一条已过期的记录去下载，
+						// 拿到 404 的错误文本，然后**存成一个顶着原文件名的假文件**。
+						if fileReceive.Expire > 0 && fileReceive.Expire < time.Now().Unix() {
+							s.logger.Printf("尝试访问已过期的文件: %s (ID: %d)", fileReceive.Name, id)
+							writeError(w, http.StatusNotFound, "file_expired", "File expired", "文件已过期")
+							return
 						}
+
+						// ⚠️ 形状与 `GET /content`（列表）**共用一份实现**（contentEntryOf）——
+						// 列表里的条目和单条取出来的必须是同一个形状，否则客户端要写两套解析。
+						responseData, _ := contentEntryOf(msg)
 
 						w.Header().Set("Content-Type", "application/json")
 						json.NewEncoder(w).Encode(responseData)
@@ -941,11 +1435,19 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 						return
 					}
 
+					// 非 JSON 分支同样要拦过期：记录已声明过期，却还能把字节吐出去，
+					// 浏览器直连 /content/<id> 就能绕过上面的检查拿到已过期文件。
+					if msg.Data.FileReceive.Expire > 0 && msg.Data.FileReceive.Expire < time.Now().Unix() {
+						s.logger.Printf("尝试访问已过期的文件: %s (ID: %d)", msg.Data.FileReceive.Name, id)
+						writeError(w, http.StatusNotFound, "file_expired", "File expired", "文件已过期")
+						return
+					}
+
 					filePath := filepath.Join(s.storageFolder, msg.Data.FileReceive.Cache)
 					file, openErr := os.Open(filePath)
 					if openErr != nil {
 						s.logger.Printf("错误: 打开文件失败: %v", openErr)
-						http.Error(w, "文件在磁盘上未找到", http.StatusNotFound)
+						writeError(w, http.StatusNotFound, "file_expired", "File expired or cleaned up", "文件已过期或已被清理")
 						return
 					}
 					defer file.Close()
@@ -953,7 +1455,7 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 					stat, statErr := file.Stat()
 					if statErr != nil {
 						s.logger.Printf("错误: 获取文件状态失败: %v", statErr)
-						http.Error(w, "无法获取文件状态", http.StatusInternalServerError)
+						writeError(w, http.StatusInternalServerError, "file_stat_failed", "Cannot read file info", "无法读取文件状态")
 						return
 					}
 
@@ -967,15 +1469,10 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 				}
 			case "text":
 				if msg.Data.TextReceive != nil {
-					// 返回格式判断优先级：1. isJSONRequest参数 2. Accept头
-					if isJSONRequest || strings.Contains(r.Header.Get("Accept"), "application/json") {
-						// JSON格式响应
-						responseData := map[string]interface{}{
-							"type":      "text",
-							"content":   msg.Data.TextReceive.Content,
-							"id":        strconv.Itoa(msg.Data.ID()),
-							"timestamp": msg.Data.TextReceive.Timestamp,
-						}
+					// 文本分支：显式格式优先，没显式时才看 Accept（文件分支不看，见 wantsJSON）
+					if wantsJSON(explicitFormat, r) {
+						// 形状与 `GET /content`（列表）**共用一份实现** —— 见文件分支的注释。
+						responseData, _ := contentEntryOf(msg)
 
 						w.Header().Set("Content-Type", "application/json")
 						json.NewEncoder(w).Encode(responseData)
@@ -997,19 +1494,227 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// 内容未找到时的响应格式也遵循JSON请求参数
-	if unauthorized && hasRequestedRoom {
-		writeAuthJSONError(w, http.StatusUnauthorized, "无权访问该房间")
+	// 鉴权失败优先于“未找到”，避免把缺密码/过期分享 token 误报成内容不存在
+	if unauthorized {
+		writeError(w, http.StatusUnauthorized, "room_forbidden", "No access to this room", "无权访问该房间")
 		return
 	}
 	s.logger.Printf("未找到内容 ID: %d", id)
-	if isJSONRequest {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "内容未找到"})
-	} else {
-		http.Error(w, "内容未找到", http.StatusNotFound)
+	writeError(w, http.StatusNotFound, "content_not_found", "Content not found", "内容未找到")
+}
+
+// ContentListResponse 是 `GET /content` 的响应体。
+//
+// ⚠️ **不给 `hasMore` / `nextBefore`**（见 handleContentList 的注释）——
+// 少一个字段就少一处会漂的东西。
+type ContentListResponse struct {
+	Messages []map[string]interface{} `json:"messages"`
+}
+
+// applyAutomationFields 把「定时消息专有」的三个字段补进条目 —— **只在有值的时候补**。
+//
+// ⚠️★ **空值必须省略**（与 `ReceiveBase` 上的 `omitempty` 一致）：不留神写成「总是给」的话，
+// **所有普通消息**都会凭空多出 `"source":""` / `"scheduledAt":0` / `"late":false` 三个键 ——
+// 那等于把「少数派」从 Worker 换回 Go/Rust（Worker 没有自动化能力，永远不输出它们），
+// §0.5 刚统一好的三边条目形状又裂开。
+//
+// ⚠️ **为什么要补它们**：`components/received-item/Text.vue` 的「定时」/「补发」两个标记
+// 读的就是这三个字段（`util.js` 的 `isAutomationMessage` / `isLateMessage`）——
+// 历史改走 `GET /content` 之后，少了它们会让标记**刷新后静默消失**（不报错、不 4xx）。
+// 详见 `docs/specs/ws-live-only.md` §0.6。
+func applyAutomationFields(entry map[string]interface{}, base ReceiveBase) {
+	if base.Source != "" {
+		entry["source"] = base.Source
 	}
+	if base.ScheduledAt != 0 {
+		entry["scheduledAt"] = base.ScheduledAt
+	}
+	if base.Late {
+		entry["late"] = base.Late
+	}
+}
+
+// contentEntryOf 把一条消息投影成 `/content/<id>` 与 `/content`（列表）共用的 JSON。
+//
+// ⚠️ 抽成一个函数、而不是每个 handler 各写一份 map：两个端点的**响应形状必须逐字相同**
+// ——客户端拿列表里的条目直接渲染，不会为两个端点写两套解析。而这个项目的老毛病
+// 正是「两份实现必然漂」（`CONTRIBUTING.md` §6 的反模式）。
+//
+// 返回 `false` 表示这条消息的类型不认识，调用方跳过它。
+func contentEntryOf(msg PostEvent) (map[string]interface{}, bool) {
+	switch msg.Data.Type() {
+	case "file":
+		f := msg.Data.FileReceive
+		if f == nil {
+			return nil, false
+		}
+		entry := map[string]interface{}{
+			"type": DetermineResponseType(f.Name),
+			"name": f.Name,
+			"size": f.Size,
+			"uuid": f.Cache,
+			// ⚠️★ **拼上文件名**，与 `/content/latest` 逐字一致（2026-09-26 统一的）。
+			//
+			// 为什么统一到**这个**形式而不是反过来（裸的 `/file/<uuid>`）：
+			//   ① 它和 `docs/api.md` 里记的路由形状（`GET /file/:uuid/:name`）一致；
+			//   ② 客户端拿到的 url **直接就能下载** —— 不用自己拼，也就不会把
+			//      `encodeURIComponent` 漏掉或写错（Android 捷径那边就是自己拼的，
+			//      它拼错了整整一路「文件 401」的 bug）；
+			//   ③ 反过来要动 `/content/latest`，而那边有 Worker 的测试钉着
+			//      （`check('url 带上了文件名')`）→ 动它就得三方一起改。
+			//
+			// ⚠️ 手工拼而不是 `filepath.Join`：后者内部会 Clean，把 `http://host` 的双斜杠
+			// 收成 `http:/host`，url 直接是坏的（`content_url_test.go` 就是为这个立的）。
+			// ⚠️ 文件名必须 **PathEscape** —— 它可能是中文、可能带 `?` / `#`。
+			"url":       f.URL + "/" + url.PathEscape(f.Name),
+			"id":        strconv.Itoa(msg.Data.ID()),
+			"timestamp": f.Timestamp,
+			"expire":    f.Expire,
+			// ⚠️★ 下面这几个是 2026-09-26 补的。**目标形状 = WS `receive` 事件的载荷本身**
+			// （SPA 就是按那个形状渲染历史的，逐字段相等 → 它换数据来源时渲染一行都不用改）。
+			//
+			// ⚠️ 补之前这里是**最小投影**，而 SPA **每个**渲染模式都在读 `senderDevice` / `senderIP`
+			// （`received-item/Text.vue`、`File.vue`、三个 wall…）→ 换来源会让气泡上的
+			// 「谁发的」标签和 IP 行**静默消失**（`v-if` 判空，不报错、不 4xx）。
+			// 而且 Worker 一直是富的、`docs/api.md` 的例子里也有这两个字段 ——
+			// **少数派是这里，不是 Worker**。见 `docs/specs/ws-live-only.md` §0.5。
+			"room":     f.Room,
+			"senderIP": f.SenderIP,
+			// ⚠️ `senderClientID` 在 `ReceiveBase` 上是 `omitempty`，这里**总是给**
+			// （空串也是空串）。差别只在「字段在不在」：客户端按真假判断，两种写法行为相同。
+			"senderClientID": f.SenderClientID,
+			"senderDevice":   f.SenderDevice,
+			"cache":          f.Cache,
+			// ⚠️ 缩略图**要带上**：WS 的历史回放本来就把缩略图推给客户端（同样那 100 条），
+			// 所以这里带上**不是回归**；不带的话历史里的文件会**丢预览图**。
+			// （§2.3 担心的「2MB」说的是 1 万条那种规模，不是缩略图。）
+			"thumbnail": f.Thumbnail,
+			// 空串 = 待办（看板列，见 handleContentColumn）
+			"column": f.Column,
+		}
+		applyAutomationFields(entry, f.ReceiveBase)
+		return entry, true
+
+	case "text":
+		t := msg.Data.TextReceive
+		if t == nil {
+			return nil, false
+		}
+		entry := map[string]interface{}{
+			"type":      "text",
+			"content":   t.Content,
+			"id":        strconv.Itoa(msg.Data.ID()),
+			"timestamp": t.Timestamp,
+			// 与文件分支同一批补的字段 —— 见那边的注释（目标形状 = WS 载荷）。
+			"room":           t.Room,
+			"senderIP":       t.SenderIP,
+			"senderClientID": t.SenderClientID,
+			"senderDevice":   t.SenderDevice,
+			"column":         t.Column,
+		}
+		applyAutomationFields(entry, t.ReceiveBase)
+		return entry, true
+	}
+	return nil, false
+}
+
+// contentListHardCap 单次最多返回多少条 —— 一条**与 `server.history` 无关的硬上限**。
+//
+// ⚠️★ 为什么必须另有一条：`server.history` 是**用户可配**的（设成 10000 也合法），
+// 而分页的每一页都要塞进**一次** HTTP 响应。只跟着配置走的话，`limit=999999`
+// 会被夹到 10000 —— 那正是这个变更要消灭的「一次推 2MB」，只是从 WS 挪到了 HTTP，
+// **等于没改**。有了硬上限，任何一次请求都是有界的；想看更早的，用 `before` 游标
+// 一页页往回翻（那正是分页存在的意义）。
+//
+// 100：落在 §2.1 说的主流档里（Slack 100 / Discord 100），而且**比缺省 50 大**，
+// 所以默认部署的行为一个字都不变（有效上限 = min(50, 100) = 50）。
+const contentListHardCap = 100
+
+// resolveContentListLimit 读 `?limit=`，并**夹在有效上限以内**。
+//
+// 有效上限 = `min(server.history, contentListHardCap)` ——
+// 缺省 / 非法 / 非正 / 超过有效上限 → 一律取有效上限。
+//
+// ⚠️ 缺省值与有效上限**必须是同一个数**（同一根旋钮，见 §2.1）：若缺省给 20、上限给 50，
+// 那「不传」和「传 50」会拿到不同的量，而调用方没法从「我没传」推出「我会拿到多少」。
+func (s *ClipboardServer) resolveContentListLimit(raw string) int {
+	max := s.config.Server.History
+	if max < 0 {
+		max = 0
+	}
+	if max > contentListHardCap {
+		max = contentListHardCap
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n <= 0 || n > max {
+		return max
+	}
+	return n
+}
+
+// handleContentList 处理 `GET /content?room=&before=&limit=` —— **历史分页**。
+//
+// 为什么要有它：历史以前只能从 WS 握手推来，于是「往回翻」做不到、而且每次连接
+// 都要把整个房间的历史推一遍。现在 WS **只推实时**（握手不再推历史了），
+// 历史一律走这个正经的查询接口 —— 详见 `docs/specs/ws-live-only.md`。
+//
+// 契约要点（每条都有理由，改之前先读那份 spec）：
+//
+//   - 游标是 **`id` 而不是时间戳** —— 时间戳是**秒级**、同秒会重复，用它做游标会**漏条或重复**；
+//   - `limit` **被 `server.history` 夹住**（见 resolveContentListLimit）；
+//   - 返回 **正序**（旧的在前）—— 客户端直接 append；
+//   - **游标失效不报错**：`before` 指向一条已被撤销的消息是很正常的事，
+//     那不是客户端的错，退化成「最近 limit 条」就好，5xx 只会让它卡住。
+func (s *ClipboardServer) handleContentList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET is allowed", "仅允许 GET 请求")
+		return
+	}
+
+	room := normalizeRoomName(r.URL.Query().Get("room"))
+
+	// 鉴权与 /content/latest **同一套**（房间闸门 + 凭据），不是新写一份。
+	if !s.canAccessRoom(room, extractAuthToken(r)) {
+		writeError(w, http.StatusUnauthorized, "room_forbidden", "No access to this room", "无权访问该房间")
+		return
+	}
+
+	limit := s.resolveContentListLimit(r.URL.Query().Get("limit"))
+
+	before := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("before")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			before = n
+		}
+		// 认不出的 `before` 不报错 —— 见函数注释最后一条。
+	}
+
+	s.messageQueue.Lock()
+	var candidates []PostEvent
+	for _, msg := range s.messageQueue.List {
+		if normalizeRoomName(msg.Data.Room()) != room {
+			continue
+		}
+		if before > 0 && msg.Data.ID() >= before {
+			continue
+		}
+		candidates = append(candidates, msg)
+	}
+	// 列表按 id 升序追加，所以「最近 limit 条」就是**尾部** limit 条。
+	if len(candidates) > limit {
+		candidates = candidates[len(candidates)-limit:]
+	}
+	s.messageQueue.Unlock()
+
+	messages := make([]map[string]interface{}, 0, len(candidates))
+	for _, msg := range candidates {
+		if entry, ok := contentEntryOf(msg); ok {
+			messages = append(messages, entry)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ContentListResponse{Messages: messages})
 }
 
 func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Request) {
@@ -1017,12 +1722,12 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 	_, hasRequestedRoom := r.URL.Query()["room"]
 	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
 
-	// // 检查是否是 latest.json 请求
-	isJSONRequest := strings.HasSuffix(r.URL.Path, "latest.json")
-	jsonParam := r.URL.Query().Get("json")
-	if jsonParam == "true" || jsonParam == "1" {
-		isJSONRequest = true
+	explicitFormat, formatOK := resolveContentFormat(r)
+	if !formatOK {
+		writeError(w, http.StatusBadRequest, "unsupported_format", "Unsupported format", "不支持的格式（只支持 raw / json）")
+		return
 	}
+	isJSONRequest := explicitFormat == "json"
 
 	s.logger.Printf("处理最新内容请求 (房间参数存在: %t, JSON请求: %t)", hasRequestedRoom, isJSONRequest)
 
@@ -1032,19 +1737,12 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 	// 检查消息队列是否为空
 	if len(s.messageQueue.List) == 0 {
 		s.logger.Printf("没有可用的内容")
-		if isJSONRequest {
-			// 如果是JSON请求，返回JSON格式的404响应
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "内容未找到"})
-		} else {
-			// 普通请求，返回普通404
-			http.Error(w, "没有可用的内容", http.StatusNotFound)
-		}
+		writeError(w, http.StatusNotFound, "no_content", "No content available", "没有可用的内容")
 		return
 	}
 
 	// 从后向前查找匹配房间的最新消息
+	// latest 不支持分享 token（无稳定资源 id），仅房间密码
 	unauthorized := false
 	for i := len(s.messageQueue.List) - 1; i >= 0; i-- {
 		msg := s.messageQueue.List[i]
@@ -1069,17 +1767,31 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 			if msg.Data.Type() == "file" && msg.Data.FileReceive != nil {
 				// 确定文件类型
 				fileReceive := msg.Data.FileReceive
+
+				// 过期检查必须放在返回之前：否则客户端会拿着一条已过期的记录去下载，
+				// 拿到 404 的错误文本，然后**存成一个顶着原文件名的假文件**。
+				if fileReceive.Expire > 0 && fileReceive.Expire < time.Now().Unix() {
+					s.logger.Printf("尝试访问已过期的文件: %s (ID: %d)", fileReceive.Name, msg.Data.ID())
+					writeError(w, http.StatusNotFound, "file_expired", "File expired", "文件已过期")
+					return
+				}
+
 				responseType = DetermineResponseType(fileReceive.Name)
 
 				// 构建JSON响应
 				responseData = map[string]interface{}{
-					"type":      responseType,
-					"name":      fileReceive.Name,
-					"size":      fileReceive.Size,
-					"uuid":      fileReceive.Cache,
-					"url":       filepath.Join(fileReceive.URL, fileReceive.Name),
+					"type": responseType,
+					"name": fileReceive.Name,
+					"size": fileReceive.Size,
+					"uuid": fileReceive.Cache,
+					// 不能用 filepath.Join：它内部会 Clean，把 "http://host" 里的双斜杠
+					// 收成 "http:/host"，客户端拿到的 url 直接是坏的。
+					"url":       fileReceive.URL + "/" + url.PathEscape(fileReceive.Name),
 					"id":        strconv.Itoa(msg.Data.ID()),
 					"timestamp": fileReceive.Timestamp,
+					"expire":    fileReceive.Expire,
+					// 空串 = 待办（看板列，见 handleContentColumn）
+					"column": fileReceive.Column,
 				}
 			} else if msg.Data.Type() == "text" && msg.Data.TextReceive != nil {
 				responseType = "text"
@@ -1088,6 +1800,8 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 					"content":   msg.Data.TextReceive.Content,
 					"id":        strconv.Itoa(msg.Data.ID()),
 					"timestamp": msg.Data.TextReceive.Timestamp,
+					// 空串 = 待办（看板列，见 handleContentColumn）
+					"column": msg.Data.TextReceive.Column,
 				}
 			} else {
 				// 未知类型，提供基本信息
@@ -1107,6 +1821,13 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 		// 非JSON请求，按原有逻辑处理
 		if msg.Data.Type() == "file" && msg.Data.FileReceive != nil {
 			// 文件类型，直接提供文件内容而不是重定向
+			// 与 JSON 分支保持一致：过期记录不能再吐出字节（浏览器直连走的就是这条路）。
+			if msg.Data.FileReceive.Expire > 0 && msg.Data.FileReceive.Expire < time.Now().Unix() {
+				s.logger.Printf("尝试访问已过期的文件: %s (ID: %d)", msg.Data.FileReceive.Name, msg.Data.ID())
+				writeError(w, http.StatusNotFound, "file_expired", "File expired", "文件已过期")
+				return
+			}
+
 			cacheUUID := msg.Data.FileReceive.Cache
 			filename := msg.Data.FileReceive.Name
 
@@ -1116,7 +1837,7 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 			file, err := os.Open(filePath)
 			if err != nil {
 				s.logger.Printf("错误: 打开文件失败: %v", err)
-				http.Error(w, "文件在磁盘上未找到", http.StatusNotFound)
+				writeError(w, http.StatusNotFound, "file_missing_on_disk", "File missing on disk", "文件在磁盘上未找到")
 				return
 			}
 			defer file.Close()
@@ -1124,7 +1845,7 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 			stat, err := file.Stat()
 			if err != nil {
 				s.logger.Printf("错误: 获取文件状态失败: %v", err)
-				http.Error(w, "无法获取文件状态", http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "file_stat_failed", "Cannot read file info", "无法获取文件状态")
 				return
 			}
 
@@ -1149,9 +1870,8 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 			return
 
 		} else if msg.Data.Type() == "text" && msg.Data.TextReceive != nil {
-			// 文本类型，检查Accept头决定是否返回JSON
-			acceptHeader := r.Header.Get("Accept")
-			if strings.Contains(acceptHeader, "application/json") {
+			// 同上：文本分支显式优先，没显式才看 Accept
+			if wantsJSON(explicitFormat, r) {
 				// 客户端请求JSON格式
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(msg)
@@ -1171,46 +1891,31 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	if unauthorized && hasRequestedRoom {
-		writeAuthJSONError(w, http.StatusUnauthorized, "无权访问该房间")
+	if unauthorized {
+		writeError(w, http.StatusUnauthorized, "room_forbidden", "No access to this room", "无权访问该房间")
 		return
 	}
 	s.logger.Printf("未找到匹配的最新内容")
-	if isJSONRequest {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "内容未找到"})
-	} else {
-		http.Error(w, "未找到匹配的内容", http.StatusNotFound)
-	}
+	writeError(w, http.StatusNotFound, "content_not_found", "Content not found", "未找到匹配的内容")
 }
 
 // handleRooms 处理房间列表请求
 func (s *ClipboardServer) handleRooms(w http.ResponseWriter, r *http.Request) {
-	// 添加 CORS 头
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Room-Auth-Tokens")
-
-	// 处理预检请求
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+	// ⚠️ 这一层以前也自己抄了一份（还是 `*`）。现在与其它三处共用 `corsPreflight`。
+	// 这里仍然显式调一次（而不是「反正路由上挂了 corsMiddleware」）——
+	// 挂载方式是**别处**决定的，把 CORS 的正确性寄托在它上面，就是下一个抄件的来源。
+	if corsPreflight(w, r, corsMethodsRead, corsHeadersAll) {
 		return
 	}
 
 	if r.Method != http.MethodGet {
-		http.Error(w, "仅允许 GET 请求", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET is allowed", "仅允许 GET 请求")
 		return
 	}
 
 	// 检查是否启用房间列表功能
 	if !s.config.Server.RoomList {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error":   "Forbidden",
-			"message": "房间列表功能未启用",
-		})
+		writeError(w, http.StatusForbidden, "room_list_disabled", "Room list disabled", "房间列表功能未启用")
 		return
 	}
 
@@ -1225,7 +1930,7 @@ func (s *ClipboardServer) handleRooms(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		s.logger.Printf("错误: 编码房间列表响应失败: %v", err)
-		http.Error(w, "编码响应失败", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "encode_failed", "Failed to encode response", "编码响应失败")
 		return
 	}
 

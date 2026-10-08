@@ -18,10 +18,10 @@ export function parseUserAgent(uaString = '') {
   const isMobile = !isTablet && /Mobile|iPhone|Android/i.test(ua);
   const isBot = /bot|crawler|spider|curl|wget/i.test(ua);
 
-  let type = 'Desktop';
-  if (isBot) type = 'Bot';
-  else if (isTablet) type = 'Tablet';
-  else if (isMobile) type = 'Mobile';
+  let type = 'desktop';
+  if (isBot) type = 'other';
+  else if (isTablet) type = 'tablet';
+  else if (isMobile) type = 'smartphone';
 
   let os = 'Unknown';
   if (/Windows NT 10\.0/i.test(ua)) os = 'Windows 10';
@@ -41,6 +41,12 @@ export function parseUserAgent(uaString = '') {
   else if (/Version\/(\d+).+Safari/i.test(ua)) browser = `Safari ${extractVersion(ua, /Version\/(\d+)/i)}`.trim();
   else if (/Safari/i.test(ua)) browser = 'Safari';
 
+  // 关键词全部落空时用识别出的系统兜底，避免出现 "iOS 17 + desktop" 这类
+  // 自相矛盾的组合（与 Go 侧 detectDeviceType 的兜底规则保持一致）。
+  if (type === 'desktop' && isMobileOSFamily(os)) {
+    type = 'smartphone';
+  }
+
   let device = type;
   if (/iPhone/i.test(ua)) device = 'iPhone';
   else if (/iPad/i.test(ua)) device = 'iPad';
@@ -52,18 +58,116 @@ export function parseUserAgent(uaString = '') {
   return { type, device, os, browser };
 }
 
-export function buildSenderDevice(uaString = '') {
+// isMobileOSFamily 判断识别出的系统是否属于移动端，供 type 兜底使用
+export function isMobileOSFamily(os = '') {
+  return /^(iOS|iPadOS|Android|Windows Phone|BlackBerry|Symbian)/i.test(String(os).trim());
+}
+
+// 设备名长度上限（按字符数，不是字节数），与 Go 侧 deviceNameMaxLen 保持一致
+const DEVICE_NAME_MAX_LEN = 32;
+
+// sanitizeDeviceName 清洗客户端传入的设备名，挡住日志污染与超长载荷。
+// 与 Go 侧 sanitizeDeviceName 行为一致：剔除控制字符、裁掉首尾空白、按字符截断。
+export function sanitizeDeviceName(raw = '') {
+  let name = String(raw == null ? '' : raw).replace(/[\u0000-\u001f\u007f]/g, '');
+  name = name.trim();
+  // 用 Array.from 按码点切分，避免把代理对（emoji 等）截成半个
+  const chars = Array.from(name);
+  if (chars.length > DEVICE_NAME_MAX_LEN) {
+    name = chars.slice(0, DEVICE_NAME_MAX_LEN).join('').trim();
+  }
+  return name;
+}
+
+// buildSenderDevice 组装消息里的发送端信息。
+// deviceName 为空时不写入 name 字段，使旧客户端的载荷与改动前逐字一致。
+export function buildSenderDevice(uaString = '', deviceName = '') {
   const deviceInfo = parseUserAgent(uaString);
-  return {
+  const info = {
     type: deviceInfo.type,
     os: deviceInfo.os,
     browser: deviceInfo.browser,
   };
+  const name = sanitizeDeviceName(deviceName);
+  if (name) {
+    info.name = name;
+  }
+  return info;
 }
 
 function normalizeRoomName(room = '') {
   const normalized = String(room || '').trim();
   return normalized === '' || normalized === 'default' ? 'default' : normalized;
+}
+
+// historyLimit 这个 Worker 的「每房间保留多少条历史」——
+// **客户端看得见的那三处**（`GET /content` 的上限、WS 推历史、握手 config 的 `server.history`）
+// 从这里取同一个数，别在别处再算一遍。
+//
+// 为什么必须只有一份：`docs/specs/ws-live-only.md` §2.1 要求 `GET /content` 的
+// **缺省值和上限是同一个数（同一根旋钮）** —— 各写各的迟早会漂成
+// 「HTTP 给 100、WS 给 50」，而 SPA 换数据来源时就会看出历史变了一截。
+//
+// 缺省 50：与 Go（`defaultConfig().Server.History`）和 Rust（`ServerConfig::default()`）
+// **是同一个数** —— Jonny 2026-09-26 定的「三端统一 50」。别在这里另挑一个数：
+// 这个缺省一旦和另两端不一样，「同一个客户端换后端就少看/多看一截历史」又会回来。
+//
+// ⚠️ 落库前的裁剪（`cleanupOldMessagesBeforeSave`）**不在**这三处里：它有自己的缺省
+// （没配 `HISTORY_LIMIT` 时留 50）。那是**写入侧**的留存策略，不是客户端看得见的那个数，
+// 两者取不同的缺省是既有的，没在这次改动里动它 —— 别以为改这里就会连着改到裁剪。
+export function historyLimit(env) {
+  return parseInt(env?.HISTORY_LIMIT ?? '', 10) || 50;
+}
+
+// deviceName 无法从 userAgent 反推，只能单独存一列。
+// 这里用一次幂等的 ALTER 自愈，省得让已有部署手工跑迁移；结果按 db 对象缓存
+// （用 WeakMap 而不是模块级布尔，避免同一个 isolate 里换了数据库还沿用旧结论）。
+const deviceNameColumnReady = new WeakMap();
+
+async function ensureDeviceNameColumn(db) {
+  if (deviceNameColumnReady.has(db)) {
+    return deviceNameColumnReady.get(db);
+  }
+  let ready;
+  try {
+    await db.prepare('ALTER TABLE messages ADD COLUMN deviceName TEXT').run();
+    ready = true;
+  } catch (error) {
+    // 列已存在时会报 duplicate column name，属预期；其他错误则退回旧列集，保证消息仍能落库
+    ready = /duplicate column/i.test(String(error && error.message));
+    if (!ready) {
+      console.warn('deviceName 列不可用，本次跳过该字段:', error);
+    }
+  }
+  deviceNameColumnReady.set(db, ready);
+  return ready;
+}
+
+// 看板的列（todo / doing / done）。和 deviceName 一样，靠一次幂等的 ALTER 自愈 ——
+// 已有部署不必手工跑迁移。
+//
+// ⚠️ 数据库列名用 `boardColumn`，不用 `column`：`column` 是 SQL 关键字，
+// SQLite 多数场合允许它当标识符，但没必要在每条 SQL 里赌这一点。
+// 对外（JSON 响应 / API 请求体）仍然叫 `column`，两边的映射在读取处做。
+const boardColumnReady = new WeakMap();
+
+export async function ensureBoardColumn(db) {
+  if (boardColumnReady.has(db)) {
+    return boardColumnReady.get(db);
+  }
+  let ready;
+  try {
+    await db.prepare('ALTER TABLE messages ADD COLUMN boardColumn TEXT').run();
+    ready = true;
+  } catch (error) {
+    // 列已存在时会报 duplicate column name，属预期；其他错误就让看板列退回「只读」
+    ready = /duplicate column/i.test(String(error && error.message));
+    if (!ready) {
+      console.warn('boardColumn 列不可用，看板列将无法保存:', error);
+    }
+  }
+  boardColumnReady.set(db, ready);
+  return ready;
 }
 
 export async function saveToD1(db, messageData, env) { // 修复：添加 env 参数
@@ -78,10 +182,8 @@ export async function saveToD1(db, messageData, env) { // 修复：添加 env �
     const filesToCleanup = await cleanupOldMessagesBeforeSave(db, room, env); // 修复：传递 env
 
     // 保存新消息
-    const result = await db.prepare(`
-      INSERT INTO messages (type, content, name, size, room, timestamp, senderIP, userAgent, uuid, expireTime, url)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
+    const columns = ['type', 'content', 'name', 'size', 'room', 'timestamp', 'senderIP', 'senderClientID', 'userAgent'];
+    const values = [
       messageData.type,
       messageData.content || null,
       messageData.name || null,
@@ -89,11 +191,19 @@ export async function saveToD1(db, messageData, env) { // 修复：添加 env �
       room,
       messageData.timestamp,
       messageData.senderIP || 'unknown',
+      messageData.senderClientID || '',
       messageData.userAgent || 'unknown',
-      messageData.uuid || null,
-      messageData.expireTime || null,
-      messageData.url || null
-    ).run();
+    ];
+    if (await ensureDeviceNameColumn(db)) {
+      columns.push('deviceName');
+      values.push(sanitizeDeviceName(messageData.deviceName));
+    }
+    columns.push('uuid', 'expireTime', 'url');
+    values.push(messageData.uuid || null, messageData.expireTime || null, messageData.url || null);
+
+    const result = await db.prepare(
+      `INSERT INTO messages (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`
+    ).bind(...values).run();
 
     // 返回新消息ID和需要删除的文件列表
     return {

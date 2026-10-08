@@ -136,6 +136,9 @@ func NewClipboardServer(cfg *Config) (*ClipboardServer, error) {
 		// 初始化房间管理相关字段
 		roomStats:      make(map[string]*RoomStat),
 		roomStatsMutex: sync.RWMutex{},
+
+		// 局域网延迟统计
+		latency: newLatencyTracker(30),
 	}
 
 	if err := s.loadHistoryData(); err != nil {
@@ -167,8 +170,18 @@ func (s *ClipboardServer) loadHistoryData() error {
 
 	var loadedHist History // History struct from types.go
 	if err := json.Unmarshal(data, &loadedHist); err != nil {
-		s.logger.Printf("无法解析历史数据 %s: %v。将尝试删除损坏的历史文件。", s.historyFilePath, err)
-		os.Remove(s.historyFilePath)
+		// **不删除**。以前这里写的是 os.Remove —— 一次崩溃/截断就等于「抹掉用户全部历史」，
+		// 而且现场也没了，事后查不出为什么坏。改名留档：数据还在，只是不在启动路径上，
+		// 用户想抢救或想报 bug 都有东西可看。
+		//
+		// 服务端仍然以空历史启动（调用方只打印警告），行为和以前一致 —— 变的只是
+		// 「文件保住了」。
+		quarantined := fmt.Sprintf("%s.corrupt-%s", s.historyFilePath, time.Now().Format("20060102-150405"))
+		if renameErr := os.Rename(s.historyFilePath, quarantined); renameErr != nil {
+			s.logger.Printf("无法解析历史数据 %s: %v。改名留档也失败(%v)，原文件保持不动。", s.historyFilePath, err, renameErr)
+		} else {
+			s.logger.Printf("无法解析历史数据 %s: %v。已改名留档到 %s（未删除）。", s.historyFilePath, err, quarantined)
+		}
 		return fmt.Errorf("无法解析历史数据 %s: %w", s.historyFilePath, err)
 	}
 
@@ -207,7 +220,41 @@ func (s *ClipboardServer) loadHistoryData() error {
 	return nil
 }
 
+// saveHistoryAsync 触发一次历史落盘，但**可等待**。
+//
+// 为什么不直接写 `go s.saveHistoryData()`：裸的 goroutine 没有任何句柄，
+// 谁都不知道它什么时候写完。于是两件事会踩坑 ——
+//  1. 进程退出时最后一次改动可能还没落盘；
+//  2. 测试里更明显：t.TempDir() 的清理会和它抢同一个目录，报
+//     "TempDir RemoveAll cleanup: directory not empty"（TestBoardColumnUpdate 因此偶发失败）。
+//
+// 计数器让「等它写完」成为一件有名字、有位置的事。
+func (s *ClipboardServer) saveHistoryAsync() {
+	s.historyWriteWG.Add(1)
+	go func() {
+		defer s.historyWriteWG.Done()
+		s.saveHistoryData()
+	}()
+}
+
+// WaitForHistoryWrites 等到所有在途的历史落盘结束。
+// Stop() 会调它；测试也在清理阶段调（见 newShortcutServer）。
+func (s *ClipboardServer) WaitForHistoryWrites() {
+	s.historyWriteWG.Wait()
+}
+
 func (s *ClipboardServer) saveHistoryData() {
+	// 串行化整段（快照 → 序列化 → 落盘），不是只锁落盘那一步。
+	//
+	// 这个方法有 7 个调用点，其中 handler.go 里两处是 `go s.saveHistoryData()`（改正文、
+	// 看板挪列）—— 两个并发请求会同时进来。messageQueue 的锁只保护内存切片、不保护文件，
+	// 两个 os.WriteFile 并发写同一路径会让内容交错。
+	//
+	// 锁在 messageQueue 之前拿：全项目只有这一处获取 historySaveMutex，不存在
+	// 「持 messageQueue 锁再进这里」的反向路径，所以不会死锁。
+	s.historySaveMutex.Lock()
+	defer s.historySaveMutex.Unlock()
+
 	s.logger.Printf("尝试将历史记录保存到: %s", s.historyFilePath)
 
 	s.messageQueue.Lock()
@@ -241,7 +288,9 @@ func (s *ClipboardServer) saveHistoryData() {
 		return
 	}
 
-	if err := os.WriteFile(s.historyFilePath, data, 0644); err != nil {
+	// 原子写：写临时文件 → fsync → rename。以前是 os.WriteFile 直接覆盖，
+	// 写到一半进程被杀就会留下半截 JSON，下次启动被当成损坏文件（旧逻辑还会把它删掉）。
+	if err := writeFileAtomic(s.historyFilePath, data, 0644); err != nil {
 		s.logger.Printf("写入历史文件 %s 时出错: %v", s.historyFilePath, err)
 	} else {
 		s.logger.Printf("历史记录已成功保存到 %s", s.historyFilePath)
@@ -260,9 +309,10 @@ func (s *ClipboardServer) filterHistoryMessagesLocked() {
 		if msg.Data.FileReceive != nil {
 			fileRec := msg.Data.FileReceive
 			fileInfo, existsInMap := s.uploadFileMap[fileRec.Cache]
-			if !existsInMap || fileInfo.ExpireTime < now {
+			expired := fileInfo.ExpireTime > 0 && fileInfo.ExpireTime < now
+			if !existsInMap || expired {
 				s.logger.Printf("从历史记录中过滤掉文件消息: %s (UUID: %s)，原因: 文件不存在或已过期。", fileRec.Name, fileRec.Cache)
-				if existsInMap && fileInfo.ExpireTime < now {
+				if existsInMap && expired {
 					delete(s.uploadFileMap, fileRec.Cache)
 				}
 				continue
@@ -292,12 +342,18 @@ func (s *ClipboardServer) setupRoutes() {
 	s.logger.Println("正在设置路由...")
 	prefix := s.config.Server.Prefix
 	mux := http.NewServeMux()
+
+	// 前端静态资源（+ 前端路由兜底）。两种来源统一成 fs.FS：
+	//   - 外部目录：os.DirFS（老实现的 http.Dir 不是 fs.FS，读不了外壳）
+	//   - 嵌入式：go:embed 里的 static 子目录
+	// 存到 s.staticFS 上：`/s/<token>` 要把 OG 卡片注入同一个外壳（见 spa_shell.go）。
+	var staticFS fs.FS
 	if *flg_static_dir != "" { // 检查配置中的外部静态目录
 		s.logger.Printf("从外部目录提供静态文件: %s", *flg_static_dir)
 		if _, statErr := os.Stat(*flg_static_dir); os.IsNotExist(statErr) {
 			s.logger.Printf("警告: 配置的外部静态目录 %s 不存在。将不提供前端服务。", *flg_static_dir)
 		} else {
-			mux.Handle(prefix+"/", http.StripPrefix(prefix, compressionMiddleware(http.FileServer(http.Dir(*flg_static_dir)))))
+			staticFS = os.DirFS(*flg_static_dir)
 		}
 	} else if hasEmbeddedStatic() { // 直接检测是否有嵌入的静态文件
 		s.logger.Println("使用嵌入式静态文件。")
@@ -305,24 +361,49 @@ func (s *ClipboardServer) setupRoutes() {
 		if err != nil {
 			s.logger.Fatalf("错误: 无法从 embed_static_fs 获取 'static' 子目录: %v", err)
 		}
-		mux.Handle(prefix+"/", http.StripPrefix(prefix, compressionMiddleware(http.FileServer(http.FS(fsys)))))
+		staticFS = fsys
 	} else {
 		s.logger.Println("警告: 未使用嵌入式静态文件，也未配置外部静态目录。将不提供前端服务。")
 	}
+	s.staticFS = staticFS
+	if staticFS != nil {
+		mux.Handle(prefix+"/", http.StripPrefix(prefix, compressionMiddleware(s.spaStaticHandler(staticFS, prefix))))
+	}
 
-	// HTTP 路由
-	mux.HandleFunc(prefix+"/server", s.handle_server)
+	// HTTP 路由（/server、/auth/*、/rooms、/revoke、/content 等无 authMiddleware 的路由补 CORS 头）
+	mux.HandleFunc(prefix+"/server", s.corsMiddleware(s.handle_server))
+	mux.HandleFunc(prefix+"/auth/token", s.corsMiddleware(s.handleAuthToken))
+	mux.HandleFunc(prefix+"/auth/token/refresh", s.corsMiddleware(s.handleAuthTokenRefresh))
 	mux.HandleFunc(prefix+"/push", s.handle_push)
-	mux.HandleFunc(prefix+"/rooms", s.handleRooms)
+	mux.HandleFunc(prefix+"/rooms", s.corsMiddleware(s.handleRooms))
+	// /tasks：定时自动化的管理接口。鉴权在 handler 内按**房间凭据**分档
+	// （与 /share 同一套思路），不走 authMiddleware —— 后者只回答「能不能进这个房间」，
+	// 而 /tasks 还要区分「全局密码 = 管理员」这一档，以及房间的 automation 策略。
+	mux.HandleFunc(prefix+"/tasks", s.corsMiddleware(s.handleTasks))
+	mux.HandleFunc(prefix+"/tasks/", s.corsMiddleware(s.handleTaskItem))
+	// /automation：自动化管理页（服务端渲染的独立页面，不进 SPA 构建）。
+	mux.HandleFunc(prefix+"/automation", s.handleAutomationPage)
+	// /share 在 handler 内按目标资源所在房间鉴权（支持 body 中的 file uuid）
+	mux.HandleFunc(prefix+"/share", s.handle_share)
+	// /share/list 用和「在该房间签发分享」同一套鉴权（canAccessRoom），
+	// /share/visit 只需 token 本身 —— 它是未认证的分享页上报计数用的。
+	// 两条都注册在 /share 之后，ServeMux 按最长前缀匹配，不会互相抢。
+	mux.HandleFunc(prefix+"/share/list", s.corsMiddleware(s.handleShareList))
+	mux.HandleFunc(prefix+"/share/visit", s.corsMiddleware(s.handleShareVisit))
+	// /s/<token>：分享链接的**服务端落地页**，只为社交预览（OG）而存在，见 share_landing.go。
+	mux.HandleFunc(prefix+"/s/", s.handleShareLanding)
 	mux.HandleFunc(prefix+"/file/", s.authMiddleware(s.handle_file))
 	mux.HandleFunc(prefix+"/text", s.authMiddleware(s.handle_text))
 	mux.HandleFunc(prefix+"/upload", s.authMiddleware(s.handle_upload))
 	mux.HandleFunc(prefix+"/upload/chunk", s.authMiddleware(s.handle_upload))
 	mux.HandleFunc(prefix+"/upload/chunk/", s.authMiddleware(s.handle_chunk))
 	mux.HandleFunc(prefix+"/upload/finish/", s.authMiddleware(s.handle_finish))
-	mux.HandleFunc(prefix+"/revoke/", s.handle_revoke)
-	mux.HandleFunc(prefix+"/revoke/all", s.handleClearAll)
-	mux.HandleFunc(prefix+"/content/", s.handleContent)
+	mux.HandleFunc(prefix+"/revoke/", s.corsMiddleware(s.handle_revoke))
+	mux.HandleFunc(prefix+"/revoke/all", s.corsMiddleware(s.handleClearAll))
+	mux.HandleFunc(prefix+"/content/", s.corsMiddleware(s.handleContent))
+	// `/content`（**没有**尾斜杠）是**历史分页**。Go 的 ServeMux 里 `prefix+"/content"`
+	// 只匹配精确路径，`/content/...` 走上面那条 —— 两条不冲突。
+	mux.HandleFunc(prefix+"/content", s.corsMiddleware(s.handleContentList))
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -409,6 +490,8 @@ func (s *ClipboardServer) Start() error {
 	s.runMutex.Unlock()
 
 	go s.cleanExpiredFilesLoop()
+	// 定时任务调度器：进程内 ticker，扫到期任务并投递（见 scheduler.go）。
+	s.startAutomationScheduler()
 
 	// 为每个监听器创建一个单独的HTTP服务器并启动goroutine
 	errChan := make(chan error, len(listeners))
@@ -461,6 +544,10 @@ func (s *ClipboardServer) Start() error {
 }
 
 func (s *ClipboardServer) Stop() error {
+	// ⚠️ 必须在取 runMutex **之前**调：stopAutomationScheduler 自己也要拿这把锁，
+	// 在里面调会直接死锁 —— 而 Stop 是关闭路径，死锁意味着进程关不掉。
+	s.stopAutomationScheduler()
+
 	s.runMutex.Lock()
 	defer s.runMutex.Unlock()
 
@@ -480,6 +567,8 @@ func (s *ClipboardServer) Stop() error {
 		s.logger.Printf("HTTP 服务器关闭错误: %v", err)
 		return err
 	}
+	// 等在途的历史落盘写完再返回 —— 否则最后一次改动可能随进程一起丢掉。
+	s.WaitForHistoryWrites()
 	s.logger.Println("服务器已成功关闭。")
 	return nil
 }
@@ -510,7 +599,8 @@ func (s *ClipboardServer) performCleanExpiredFiles() {
 	// 注意：并发访问 s.uploadFileMap 需要加锁
 	// s.mapMutex.Lock() // 假设有一个用于保护 map 的锁
 	for uuid, fileInfo := range s.uploadFileMap {
-		if fileInfo.ExpireTime < currentTime {
+		// ExpireTime <= 0 表示永不过期（房间级 roomAuth.fileExpire=0）
+		if fileInfo.ExpireTime > 0 && fileInfo.ExpireTime < currentTime {
 			toRemove = append(toRemove, uuid)
 		}
 	}
@@ -655,50 +745,180 @@ func hash_murmur3(data []byte, seed uint32) uint32 {
 
 func (s *ClipboardServer) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 添加 CORS 头，允许跨域请求
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Room-Auth-Tokens")
-
-		// 处理预检请求
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
+		// ⚠️ 这一层**以前自己抄了一份** CORS（还是 `*`）—— 而它罩着的是
+		// `/text`、`/upload`、`/content/:id` 这些**主数据路径**。
+		// 也就是说 2026-09-26 那次收窄（只改了 `corsMiddleware`）漏掉了最要紧的一批端点。
+		// 现在四个地方共用 `corsPreflight` 一个实现，理由写在它的注释里。
+		if corsPreflight(w, r, corsMethodsAll, corsHeadersAll) {
 			return
 		}
 
-		requirement := s.resolveRoomAuth(s.inferRequestRoom(r))
+		room := s.inferRequestRoom(r)
+		requirement := s.resolveRoomAuth(room)
 		if !requirement.Required {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		token := extractAuthToken(r)
-
 		clientIP := get_remote_ip(r)
 
-		// 验证令牌
-		if token == "" {
+		// 1) 房间密码（Authorization / ?auth=）—— 保持现有 API 兼容
+		if token != "" && s.tokenMatchesRoom(room, token) {
+			s.logger.Printf("认证成功: IP: %s, 路径: %s, 房间: %s", clientIP, r.URL.Path, requirement.Room)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 2) 短期分享 token（?t=）—— 仅放行文件下载 GET，不影响上传/删除等写操作
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, s.config.Server.Prefix+"/file/") {
+			pathPart := strings.TrimPrefix(r.URL.Path, s.config.Server.Prefix+"/file/")
+			fileUUID := strings.SplitN(pathPart, "/", 2)[0]
+			if fileUUID != "" && s.canReadSharedFile(r, fileUUID, room) {
+				s.logger.Printf("分享令牌认证成功: IP: %s, 路径: %s, 房间: %s", clientIP, r.URL.Path, requirement.Room)
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		if token == "" && extractShareToken(r) == "" {
 			s.logger.Printf("认证失败: 未提供令牌。来自 IP: %s, 路径: %s, 房间: %s", clientIP, r.URL.Path, requirement.Room)
-			writeAuthJSONError(w, http.StatusUnauthorized, "需要认证令牌")
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", "需要认证令牌")
 			return
 		}
 
-		if requirement.Password == "" {
-			s.logger.Printf("认证失败: 服务器认证配置错误。来自 IP: %s", clientIP)
-			writeAuthJSONError(w, http.StatusInternalServerError, "服务器认证配置错误")
+		s.logger.Printf("认证失败: 无效令牌。来自 IP: %s, 路径: %s, 房间: %s", clientIP, r.URL.Path, requirement.Room)
+		writeError(w, http.StatusUnauthorized, "unauthorized_invalid_token", "Invalid auth token", "无效的认证令牌")
+	}
+}
+
+// CORS 的三份「白名单内容」—— 放行哪些方法 / 哪些头。
+// ⚠️ 只有一处定义，因为下面那个 `corsPreflight` 会被**四处**调用（见它的注释）。
+const (
+	corsMethodsAll  = "GET, POST, PUT, DELETE, OPTIONS"
+	corsMethodsRead = "GET, OPTIONS"
+	corsHeadersAll  = "Content-Type, Authorization, X-Room-Auth-Tokens"
+)
+
+// corsPreflight 统一处理 CORS 头与预检。**返回 true = 这是个预检，已经回完了。**
+//
+// ⚠️★ 为什么必须是**一个**实现：原来 CORS 在**四处**各手写了一份
+// （`corsMiddleware` / `authMiddleware` / `handleRooms` / `handle_share`）。
+// 2026-09-26 把 `Access-Control-Allow-Origin: *` 收窄时**只改了其中一处** ——
+// 于是 `/text`、`/upload`、`/content/:id`（走 `authMiddleware`）、`/rooms`、`/share`
+// **仍然**对任意来源放行，而那正是这次要修的洞本身。
+//
+// ⚠️★ 抄件漏了两份，而**没有任何测试能发现**：`cors_test.go` 里那些用例只看得见
+// `allowedCORSOrigin` 这个判定函数与 `corsMiddleware` —— 另外三处各测各的、各自都「对」。
+// 「一份规则、一个实现」是这里唯一能防住它的办法（规则抄三遍就等于没有规则）。
+func corsPreflight(w http.ResponseWriter, r *http.Request, methods, headers string) bool {
+	// ⚠️ `Vary` **无条件**加，不只在放行的那一支里加 ——
+	// 「响应随 `Origin` 变」这件事**在被拒时同样成立**：一份没有放行头的响应
+	// 照样会被 HTTP 缓存存下来，之后被喂给那个**本该放行**的来源（桌面端），
+	// 症状是「桌面端一条接口都调不通」而且看着随机（取决于谁先请求过）。
+	w.Header().Add("Vary", "Origin")
+
+	if allowed := allowedCORSOrigin(r.Header.Get("Origin")); allowed != "" {
+		w.Header().Set("Access-Control-Allow-Origin", allowed)
+		w.Header().Set("Access-Control-Allow-Methods", methods)
+		w.Header().Set("Access-Control-Allow-Headers", headers)
+	}
+
+	if r.Method == http.MethodOptions {
+		// ⚠️ 预检与实际请求**必须一致地**放行：来源不被放行时这里只回 200、不带放行头，
+		// 由浏览器自己去判定预检失败。别在这儿「先放行再说」。
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+	return false
+}
+
+// corsMiddleware 给「浏览器跨源读」加放行头，并处理 OPTIONS 预检。
+//
+// ⚠️★ **2026-09-26 收窄了**：原来看是 `Access-Control-Allow-Origin: *`，那在本机服务端上是
+// **一个真的洞**。这个服务端跑在用户自己的机器上（默认 127.0.0.1:9501），而房间默认**不需要密码**
+// —— `*` 意味着**用户访问的任意网站**都能这么干：
+//
+//	fetch('http://127.0.0.1:9501/content?room=default&format=json')   // ← 读得到
+//
+// 于是「随手点开的一个网页」就能把本机剪贴板历史整段读走，而用户什么都不会察觉。
+// （`*` 只在「带凭据模式」下被浏览器拒绝，而那个模式管的是 cookie / TLS 客户端证书；
+// 一个开放的房间压根不需要凭据，所以 `*` 拦不住它。）
+//
+// ⚠️ Rust 侧是同一份规则，实现在 `clip9/crates/server/src/cors.rs` —— **两边必须一致**，
+// 否则「Go 能用、Rust 被拦」这种只在跨源时出现的差异会非常难查。
+func (s *ClipboardServer) corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if corsPreflight(w, r, corsMethodsAll, corsHeadersAll) {
 			return
 		}
-
-		if token != requirement.Password {
-			s.logger.Printf("认证失败: 无效令牌。来自 IP: %s, 路径: %s, 房间: %s", clientIP, r.URL.Path, requirement.Room)
-			writeAuthJSONError(w, http.StatusUnauthorized, "无效的认证令牌")
-			return
-		}
-
-		// 认证成功
-		s.logger.Printf("认证成功: IP: %s, 路径: %s, 房间: %s", clientIP, r.URL.Path, requirement.Room)
 		next.ServeHTTP(w, r)
 	}
+}
+
+// allowedCORSOrigin 判断这个 Origin 能不能跨源读这个服务端：能就返回它（原样回写），
+// 不能就返回空串（调用方据此**一个放行头都不发**）。
+//
+// 放行三类，就这三类：
+//
+//   - `tauri://localhost`   —— **桌面客户端**。⚠️ 这个字符串是**实测**出来的：
+//     那版注释原来猜的是 `http://tauri.localhost`，而记录型代理抓到的实际值是前者。
+//   - `http(s)://localhost[:port]`  —— 本机开发（vite dev 是 http://localhost:5173）
+//   - `http(s)://127.0.0.1[:port]` —— 同上，只是写法不同
+//
+// ⚠️ **SPA 不需要 CORS** —— 它由这个服务端自己渲染（同源）。所以要支持「前端放别处、
+// 只调这个 API」，得加一个**配置项**，而不是把 `*` 放回来。
+//
+// ⚠️ `file://` 页面（用户拿个本地 HTML 当临时客户端）发的是 `Origin: null` —— **不放行**：
+// `null` 同样也是沙箱化 iframe / `data:` URL 的来源，放行它等于把上面那个洞换个写法。
+//
+// ⚠️ `[::1]`（IPv6 回环）**没放行**：只有页面本身跑在 `[::1]` 上时浏览器才发它，
+// 极少见。真要支持得单独加一条 —— 别写成「包含 127 就算过」那种模糊判断。
+func allowedCORSOrigin(origin string) string {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return ""
+	}
+	if strings.EqualFold(origin, "tauri://localhost") {
+		return origin
+	}
+
+	var rest string
+	switch {
+	case strings.HasPrefix(origin, "http://"):
+		rest = origin[len("http://"):]
+	case strings.HasPrefix(origin, "https://"):
+		rest = origin[len("https://"):]
+	default:
+		return ""
+	}
+
+	// ⚠️ 严格形状：`Origin` 头按规范只有 `scheme://host[:port]`，
+	// 带路径 / 查询 / userinfo 的一律拒 —— 浏览器本来就只发严格形状，
+	// 宽容在这儿只会给出「看起来处理过、其实没有」的假象。
+	if strings.ContainsAny(rest, "/?#@") {
+		return ""
+	}
+
+	host, port := rest, ""
+	if i := strings.LastIndex(rest, ":"); i >= 0 {
+		host, port = rest[:i], rest[i+1:]
+		if port == "" {
+			return ""
+		}
+		for _, c := range port {
+			if c < '0' || c > '9' {
+				// `[::1]:5173` 会落到这儿（host 里残留 `[::`）—— 被拒是对的。
+				return ""
+			}
+		}
+	}
+
+	switch host {
+	case "localhost", "127.0.0.1":
+		return origin
+	}
+	return ""
 }
 
 // generateRandomString 生成指定长度的随机字符串
@@ -881,7 +1101,9 @@ func (s *ClipboardServer) getRoomList(tokens []string) []RoomInfo {
 			DeviceCount:  deviceCount,
 			LastActive:   lastActive,
 			IsActive:     deviceCount > 0,
-			IsProtected:  s.hasRoomAuthEntry(room),
+			// 用「实际需不需要密码」而不是「roomAuth 里有没有这一项」：
+			// 显式配了空密码的房间是**开放**的，报成受保护会让房间列表挂一把不存在的锁。
+			IsProtected: s.resolveRoomAuth(room).Required,
 		}
 
 		roomList = append(roomList, roomInfo)

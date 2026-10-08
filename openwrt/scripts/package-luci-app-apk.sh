@@ -12,11 +12,14 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
+# apk-tools 版本号不允许 '-' 也不允许后缀带 '.'（如 _beta.1），统一转为 _<后缀><数字>
+PKG_VERSION="$(printf '%s' "$VERSION" | sed -E 's/-([a-zA-Z]+)\.([0-9]+)/_\1\2/g; s/-([a-zA-Z]+)/_\1/g; s/-/_/g')"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(dirname "$SCRIPT_DIR")"
 LUCI_DIR="$BASE_DIR/luci-app-cloud-clipboard"
 PKG_DIR="$BASE_DIR/build/luci-app-apk"
-APK_NAME="luci-app-cloud-clipboard-${VERSION}-noarch.apk"
+APK_NAME="CCG_server-luci-apk-noarch-v${VERSION}.apk"
 TEMP_DIR="$BASE_DIR/build/.tmp-luci-app-apk-$$"
 
 to_container_path() {
@@ -144,7 +147,7 @@ run_apk_mkpkg \
     --files "$APK_FILES_DIR" \
     --output "$APK_OUTPUT_PATH" \
     --info "name:luci-app-cloud-clipboard" \
-    --info "version:$VERSION-r1" \
+    --info "version:$PKG_VERSION-r1" \
     --info "description:LuCI support for Cloud Clipboard" \
     --info "arch:noarch" \
     --info "license:MIT" \

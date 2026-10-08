@@ -11,7 +11,7 @@ on:
       tag_name:
         description: 'The existing tag to build for and update the release (e.g., v1.0.0)'
         required: true
-        default: 'v4.7.0'
+        default: 'v5.0.0'
 
 permissions:
   contents: write
@@ -22,15 +22,23 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.get_tag.outputs.tag }}
+      version_name: ${{ steps.get_tag.outputs.version_name }}
+      version_code: ${{ steps.get_tag.outputs.version_code }}
     steps:
       - name: Determine Tag Name
         id: get_tag
         run: |
           if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            TAG="${{ github.ref_name }}"
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "tag=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG="${{ github.event.inputs.tag_name }}"
           fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version_name=${TAG#v}" >> $GITHUB_OUTPUT
+          MAJOR=$(echo "${TAG#v}" | cut -d. -f1)
+          MINOR=$(echo "${TAG#v}" | cut -d. -f2)
+          PATCH=$(echo "${TAG#v}" | cut -d. -f3)
+          echo "version_code=$((MAJOR * 100000 + MINOR * 1000 + PATCH))" >> $GITHUB_OUTPUT
 
   build-frontend:
     name: Build Frontend Assets
@@ -38,28 +46,28 @@ jobs:
     needs: determine-tag
     steps:
       - name: Checkout repository at main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
 
       - name: Set up Node.js for frontend build
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
-          cache-dependency-path: client/package.json
+          cache-dependency-path: web-vue3/package.json
 
       - name: Build frontend static assets
         run: |
-          cd client
+          cd web-vue3
           npm install
           npm run build
 
       - name: Upload frontend artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
-          path: client/dist
+          path: web-vue3/dist
 
   build-apk:
     name: Build APK for ${{ matrix.arch }}
@@ -71,36 +79,36 @@ jobs:
 
     steps:
       - name: Checkout repository at main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.22'
+          go-version: '1.26'
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           java-version: '17'
           distribution: 'temurin'
 
       - name: Download frontend artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: frontend-dist
-          path: client/dist
+          path: web-vue3/dist
 
       - name: Prepare Go embed directory
         run: |
           rm -rf cloud-clip/lib/static
           mkdir -p cloud-clip/lib/static
-          cp -r client/dist/* cloud-clip/lib/static/
+          cp -r web-vue3/dist/* cloud-clip/lib/static/
 
       - name: Install and initialize gomobile
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260211191516-dcd2a3258864
           export PATH=$PATH:$(go env GOPATH)/bin
           gomobile init
 
@@ -127,7 +135,7 @@ jobs:
           cp cloudclipservice.aar ../../android/app/libs/
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Decode Signing Key
         run: echo "${{ secrets.SIGNING_KEY_STORE_BASE64 }}" | base64 --decode > $GITHUB_WORKSPACE/android/app/my-release-key.keystore
@@ -140,6 +148,8 @@ jobs:
           cd android
           ./gradlew assembleRelease \
             -PabiFilters=${{ matrix.arch }} \
+            -PversionName=${{ needs.determine-tag.outputs.version_name }} \
+            -PversionCode=${{ needs.determine-tag.outputs.version_code }} \
             -Psigning.key.alias=${{ secrets.SIGNING_KEY_ALIAS }} \
             -Psigning.key.password=${{ secrets.SIGNING_KEY_PASSWORD }} \
             -Psigning.store.file=$GITHUB_WORKSPACE/android/app/my-release-key.keystore \
@@ -156,13 +166,13 @@ jobs:
           APK_PATH=$(find android/app/build/outputs/apk -type f -name "app-${{ matrix.arch }}-release.apk")
           if [ -z "$APK_PATH" ]; then echo "::error::Per-arch APK file not found!" && exit 1; fi
           echo "Found APK at: $APK_PATH"
-          mv "$APK_PATH" "cloud-clipboard-go-${{ needs.determine-tag.outputs.tag }}-${{ matrix.arch }}.apk"
+          mv "$APK_PATH" "CCG_server-android-${{ matrix.arch }}-v${{ needs.determine-tag.outputs.version_name }}.apk"
 
       - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apk-per-arch-artifacts-${{ matrix.arch }}
-          path: cloud-clipboard-go-${{ needs.determine-tag.outputs.tag }}-${{ matrix.arch }}.apk
+          path: CCG_server-android-${{ matrix.arch }}-v${{ needs.determine-tag.outputs.version_name }}.apk
 
   build-universal-apk:
     name: Build Universal Android APK
@@ -171,36 +181,36 @@ jobs:
 
     steps:
       - name: Checkout repository at main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.22'
+          go-version: '1.26'
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           java-version: '17'
           distribution: 'temurin'
 
       - name: Download frontend artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: frontend-dist
-          path: client/dist
+          path: web-vue3/dist
 
       - name: Prepare Go embed directory
         run: |
           rm -rf cloud-clip/lib/static
           mkdir -p cloud-clip/lib/static
-          cp -r client/dist/* cloud-clip/lib/static/
+          cp -r web-vue3/dist/* cloud-clip/lib/static/
 
       - name: Install and initialize gomobile
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260211191516-dcd2a3258864
           export PATH=$PATH:$(go env GOPATH)/bin
           gomobile init
 
@@ -215,7 +225,7 @@ jobs:
           cp cloudclipservice.aar ../../android/app/libs/
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Decode Signing Key
         run: echo "${{ secrets.SIGNING_KEY_STORE_BASE64 }}" | base64 --decode > $GITHUB_WORKSPACE/android/app/my-release-key.keystore
@@ -228,6 +238,8 @@ jobs:
           cd android
           ./gradlew assembleRelease \
             -PbuildUniversal \
+            -PversionName=${{ needs.determine-tag.outputs.version_name }} \
+            -PversionCode=${{ needs.determine-tag.outputs.version_code }} \
             -Psigning.key.alias=${{ secrets.SIGNING_KEY_ALIAS }} \
             -Psigning.key.password=${{ secrets.SIGNING_KEY_PASSWORD }} \
             -Psigning.store.file=$GITHUB_WORKSPACE/android/app/my-release-key.keystore \
@@ -239,13 +251,13 @@ jobs:
           APK_PATH=$(find android/app/build/outputs/apk -type f -name "app-universal-release.apk")
           if [ -z "$APK_PATH" ]; then echo "::error::Universal APK file not found!" && exit 1; fi
           echo "Found Universal APK at: $APK_PATH"
-          mv "$APK_PATH" "cloud-clipboard-go-${{ needs.determine-tag.outputs.tag }}-universal.apk"
+          mv "$APK_PATH" "CCG_server-android-universal-v${{ needs.determine-tag.outputs.version_name }}.apk"
 
       - name: Upload Universal APK Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apk-universal-artifact
-          path: cloud-clipboard-go-${{ needs.determine-tag.outputs.tag }}-universal.apk
+          path: CCG_server-android-universal-v${{ needs.determine-tag.outputs.version_name }}.apk
 
   # 单独的 job 用于更新 Release
   update-release:
@@ -255,12 +267,12 @@ jobs:
 
     steps:
       - name: Download all APK artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Update Release with APKs
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.determine-tag.outputs.tag }}
           files: |

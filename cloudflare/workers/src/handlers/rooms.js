@@ -1,5 +1,6 @@
 import { corsHeaders } from '../cors';
-import { canAccessRoom, extractAuthTokens, hasRoomAuthEntry, normalizeRoomName, parseRoomAuth } from '../auth';
+import { canAccessRoomAsync, extractAuthTokens, normalizeRoomName, parseRoomAuth, resolveRoomAuth } from '../auth';
+import { errorResponse } from '../errors';
 
 function toDisplayRoom(room) {
   return normalizeRoomName(room) === 'default' ? '' : normalizeRoomName(room);
@@ -23,13 +24,7 @@ export class RoomsHandler {
       }
 
       if (!env.DB) {
-        return new Response(JSON.stringify({
-          error: 'Database not available',
-          message: '数据库服务不可用',
-        }), {
-          status: 503,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
+        return errorResponse(503, 'database_unavailable', 'Database not available', '数据库服务不可用');
       }
 
       const tokens = extractAuthTokens(request);
@@ -87,7 +82,9 @@ export class RoomsHandler {
       const roomEntries = await Promise.all(Array.from(roomMap.values())
         .map(async row => {
           const normalizedRoom = row.room;
-          if (!canAccessRoom(env, normalizedRoom, '') && !tokens.some(token => canAccessRoom(env, normalizedRoom, token))) {
+          const hasGlobalAccess = await canAccessRoomAsync(env, normalizedRoom, '');
+          const hasTokenAccess = await Promise.all(tokens.map(token => canAccessRoomAsync(env, normalizedRoom, token)));
+          if (!hasGlobalAccess && !hasTokenAccess.some(Boolean)) {
             return null;
           }
           const messageLastActive = Number(row.messageLastActive || 0);
@@ -100,7 +97,9 @@ export class RoomsHandler {
             deviceCount,
             lastActive: Math.max(messageLastActive, presenceLastActive),
             isActive: deviceCount > 0,
-            isProtected: hasRoomAuthEntry(env, normalizedRoom),
+            // 用「实际需不需要密码」而不是「配置里有没有这一项」：显式配空密码的房间是
+            // **开放**的，报成受保护会在房间列表上挂一把不存在的锁。
+            isProtected: resolveRoomAuth(env, normalizedRoom).required,
           };
         }));
 
@@ -113,13 +112,7 @@ export class RoomsHandler {
       });
     } catch (error) {
       console.error('Rooms handler error:', error);
-      return new Response(JSON.stringify({
-        error: 'Internal Server Error',
-        message: '获取房间列表时发生错误',
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      });
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '获取房间列表时发生错误');
     }
   }
 }

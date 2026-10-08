@@ -1,15 +1,18 @@
 name: Build OpenWrt Packages
 
 on:
-#   push:
-#     # tags:
-#     #   - 'v*' # 当创建版本标签时触发
+  workflow_call:
+    inputs:
+      version:
+        description: '版本号 (不含v前缀)'
+        required: true
+        type: string
   workflow_dispatch: # 允许手动触发
     inputs:
       version:
         description: '版本号 (不含v前缀)'
         required: true
-        default: '4.7.1'
+        default: '5.0.4'
 
 permissions:
   contents: write
@@ -20,15 +23,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.23'
+          go-version: '1.26'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -39,45 +42,45 @@ jobs:
       - name: Build binary
         run: |
           chmod +x openwrt/scripts/build.sh
-          ./openwrt/scripts/build.sh ${{ github.event.inputs.version }}
+          ./openwrt/scripts/build.sh ${{ inputs.version }}
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: openwrt-binaries-${{ github.event.inputs.version }}
-          path: openwrt/build/cloud-clipboard-${{ github.event.inputs.version }}-*
+          name: openwrt-binaries-${{ inputs.version }}
+          path: openwrt/build/cloud-clipboard-${{ inputs.version }}-*
 
   build-ipk:
     runs-on: ubuntu-latest
     needs: build-binaries
     strategy:
       matrix:
-        arch: [x86_64, i386, arm_cortex-a5, arm_cortex-a7, arm_cortex-a8, arm_cortex-a9, arm_cortex-a15_neon-vfpv4, aarch64, mips_24kc, mipsel_24kc]
+        arch: [x86_64, arm_cortex-a5, arm_cortex-a7, arm_cortex-a8, arm_cortex-a9, arm_cortex-a15_neon-vfpv4, aarch64, mips_24kc, mipsel_24kc]
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Create directory structure
         run: |
           mkdir -p openwrt/build
 
       - name: Download binary artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
-          name: openwrt-binaries-${{ github.event.inputs.version }}
+          name: openwrt-binaries-${{ inputs.version }}
           path: openwrt/build
 
       - name: Package IPK
         run: |
           chmod +x openwrt/scripts/package-openwrt.sh
-          ./openwrt/scripts/package-openwrt.sh ${{ github.event.inputs.version }} ${{ matrix.arch }}
+          ./openwrt/scripts/package-openwrt.sh ${{ inputs.version }} ${{ matrix.arch }}
 
       - name: Upload IPK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: cloud-clipboard_${{ github.event.inputs.version }}_${{ matrix.arch }}.ipk
-          path: openwrt/build/cloud-clipboard_${{ github.event.inputs.version }}_${{ matrix.arch }}.ipk
+          name: CCG_server-openwrt-ipk-${{ matrix.arch }}-v${{ inputs.version }}.ipk
+          path: openwrt/build/CCG_server-openwrt-ipk-${{ matrix.arch }}-v${{ inputs.version }}.ipk
 
   build-apk:
     runs-on: ubuntu-latest
@@ -87,26 +90,10 @@ jobs:
         include:
           - binary_arch: x86_64
             apk_arch: x86_64
-          - binary_arch: i386
-            apk_arch: i386_pentium4
-          - binary_arch: i386
-            apk_arch: i386_pentium-mmx
-          - binary_arch: arm_cortex-a5
-            apk_arch: arm_cortex-a5_vfpv4
-          - binary_arch: arm_cortex-a7
-            apk_arch: arm_cortex-a7
-          - binary_arch: arm_cortex-a7
-            apk_arch: arm_cortex-a7_neon-vfpv4
-          - binary_arch: arm_cortex-a7
-            apk_arch: arm_cortex-a7_vfpv4
-          - binary_arch: arm_cortex-a8
-            apk_arch: arm_cortex-a8_vfpv3
           - binary_arch: arm_cortex-a9
             apk_arch: arm_cortex-a9
           - binary_arch: arm_cortex-a9
             apk_arch: arm_cortex-a9_neon
-          - binary_arch: arm_cortex-a9
-            apk_arch: arm_cortex-a9_vfpv3-d16
           - binary_arch: arm_cortex-a15_neon-vfpv4
             apk_arch: arm_cortex-a15_neon-vfpv4
           - binary_arch: aarch64
@@ -117,23 +104,20 @@ jobs:
             apk_arch: aarch64_cortex-a72
           - binary_arch: aarch64
             apk_arch: aarch64_cortex-a76
-          - binary_arch: mips_24kc
-            apk_arch: mips_24kc
-          - binary_arch: mipsel_24kc
-            apk_arch: mipsel_24kc
+
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Create directory structure
         run: |
           mkdir -p openwrt/build
 
       - name: Download binary artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
-          name: openwrt-binaries-${{ github.event.inputs.version }}
+          name: openwrt-binaries-${{ inputs.version }}
           path: openwrt/build
 
       - name: Package APK
@@ -145,20 +129,20 @@ jobs:
             sh -lc '
               apk add --no-cache bash >/dev/null
               chmod +x openwrt/scripts/package-openwrt-apk.sh
-              bash ./openwrt/scripts/package-openwrt-apk.sh ${{ github.event.inputs.version }} ${{ matrix.binary_arch }} ${{ matrix.apk_arch }}
+              bash ./openwrt/scripts/package-openwrt-apk.sh ${{ inputs.version }} ${{ matrix.binary_arch }} ${{ matrix.apk_arch }}
             '
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: cloud-clipboard-${{ github.event.inputs.version }}-${{ matrix.apk_arch }}.apk
-          path: openwrt/build/cloud-clipboard-${{ github.event.inputs.version }}-${{ matrix.apk_arch }}.apk
+          name: CCG_server-openwrt-apk-${{ matrix.apk_arch }}-v${{ inputs.version }}.apk
+          path: openwrt/build/CCG_server-openwrt-apk-${{ matrix.apk_arch }}-v${{ inputs.version }}.apk
 
   build-luci:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Create directory structure
         run: |
@@ -169,7 +153,7 @@ jobs:
       - name: Package LuCI IPK
         run: |
           chmod +x openwrt/scripts/package-luci-app.sh
-          ./openwrt/scripts/package-luci-app.sh ${{ github.event.inputs.version }}
+          ./openwrt/scripts/package-luci-app.sh ${{ inputs.version }}
 
       - name: Package LuCI APK
         run: |
@@ -180,29 +164,30 @@ jobs:
             sh -lc '
               apk add --no-cache bash >/dev/null
               chmod +x openwrt/scripts/package-luci-app-apk.sh
-              bash ./openwrt/scripts/package-luci-app-apk.sh ${{ github.event.inputs.version }}
+              bash ./openwrt/scripts/package-luci-app-apk.sh ${{ inputs.version }}
             '
       
       - name: Upload LuCI IPK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: luci-app-cloud-clipboard_${{ github.event.inputs.version }}_all.ipk
-          path: openwrt/build/luci-app-cloud-clipboard_${{ github.event.inputs.version }}_all.ipk
+          name: CCG_server-luci-ipk-all-v${{ inputs.version }}.ipk
+          path: openwrt/build/CCG_server-luci-ipk-all-v${{ inputs.version }}.ipk
 
       - name: Upload LuCI APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: luci-app-cloud-clipboard-${{ github.event.inputs.version }}-noarch.apk
-          path: openwrt/build/luci-app-cloud-clipboard-${{ github.event.inputs.version }}-noarch.apk
+          name: CCG_server-luci-apk-noarch-v${{ inputs.version }}.apk
+          path: openwrt/build/CCG_server-luci-apk-noarch-v${{ inputs.version }}.apk
 
+  # 仅手动触发(workflow_dispatch)时执行：将产物覆盖上传到指定版本的 release，免去频繁发布
   release:
     needs: [build-binaries, build-ipk, build-apk, build-luci]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    
+    if: github.event_name == 'workflow_dispatch'
+
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -210,17 +195,14 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R artifacts
 
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v2
+      - name: Upload assets to release (overwrite)
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/**/*.ipk
             artifacts/**/*.apk
-          draft: false
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', github.event.inputs.version) }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', github.event.inputs.version) }}
-          generate_release_notes: true
+          overwrite_files: true
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

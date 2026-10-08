@@ -1,225 +1,123 @@
 # Cloudflare 部署文档
 
-本文档说明如何将 Cloud Clipboard 部署到 Cloudflare Workers + Pages，并与当前仓库中的自动化脚本保持一致。
+本文档说明如何将 Cloud Clipboard 部署到 Cloudflare Workers（一体化部署：SPA 静态前端 + API/WebSocket 后端 + D1 数据库 + R2 存储桶）。
 
-## 部署内容
+---
 
-执行 [cloudflare/deploy.sh](cloudflare/deploy.sh) 后，会依次完成这些步骤：
+## 🏗️ 架构与部署原理
 
-1. 创建或复用 D1 数据库 `cloud-clipboard-db`
-2. 创建或复用 R2 存储桶 `cloud-clipboard-files`
-3. 基于 [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template) 生成临时 `wrangler.toml`
-4. 执行 [cloudflare/d1/schema.sql](cloudflare/d1/schema.sql) 远程迁移
-5. 部署 Workers API
-6. 基于 [cloudflare/pages/client/src/config.js.template](cloudflare/pages/client/src/config.js.template) 生成临时 `config.js`
-7. 构建并部署 Cloudflare Pages 前端
-8. 输出 Worker API 地址和 Pages 访问地址
+部署包含以下组件：
+- **Cloudflare Workers**：托管后端 API 与 WebSocket 通信（Durable Objects）。
+- **Workers Static Assets**：托管 Vue3 构建的静态前端，**静态资源与页面访问免费且不计 Worker 请求配额**。
+- **Cloudflare D1**：存储剪贴板历史文本与文件元数据（SQLite）。
+- **Cloudflare R2**：存储上传的文件与图片。
 
-## 前置要求
+---
 
-- Node.js
-- npm
-- Cloudflare 账号
-- 已安装或可自动安装 Wrangler CLI
+## 🚀 部署方式
 
-建议先确认：
+### 方式一：GitHub Actions 自动部署（推荐）
 
-```bash
-node -v
-npm -v
-wrangler --version
-```
+仓库已提供自动化工作流 [.github/workflows/deploy-cloudflare.yml](../.github/workflows/deploy-cloudflare.yml)，无需本地安装工具。
 
-如果未登录 Wrangler：
+#### 1. 配置 GitHub Secrets
+在 GitHub 仓库 **Settings → Secrets and variables → Actions** 中配置：
 
-```bash
-wrangler login
-```
+| Secret 名称 | 必填 | 说明 |
+| :--- | :---: | :--- |
+| `CF_API_TOKEN` | ✅ | Cloudflare API Token（在 Cloudflare 后台创建自定义 Token 时，需在 **Account** 范围添加以下 4 项权限）：<br>• **Workers Scripts** → **Edit**（包含 Worker 部署与 Durable Objects）<br>• **D1** → **Edit**（用于数据库迁移与管理）<br>• **Workers R2 Storage** → **Edit**（用于文件存储桶管理）<br>• **Account Settings** → **Read**（用于账号信息验证） |
+| `CF_ACCOUNT_ID` | ✅ | Cloudflare 账号 ID（Dashboard 首页右下角或 URL 中查看） |
+| `AUTH_PASSWORD` | ✅ | 全局访问密码 |
+| `ROOM_AUTH_JSON` | ✅ | 房间级密码与过期配置（**填原始 JSON，不要加 `\` 转义**，见下文示例） |
+| `ROOM_LIST` | ➖ | 是否启用房间列表展示（可选：`true` / `false`，默认 `false`） |
+| `HISTORY_LIMIT` | ➖ | 房间历史消息条数（默认 `50`） |
+| `TEXT_LIMIT` | ➖ | 文本最大字符数（默认 `40960`） |
+| `FILE_LIMIT` | ➖ | 单文件大小上限（字节，默认 `204857600` 即 200MB） |
+| `FILE_EXPIRE` | ➖ | 全局文件过期时间（秒，默认 `3600` 即 1 小时） |
 
-也可以手动确认当前登录状态：
+#### 2. 触发部署
+进入 GitHub 仓库 **Actions** 页面，找到 **Deploy Cloudflare Worker**，点击 **Run workflow** 即可一键完成构建与部署。
 
-```bash
-wrangler whoami
-```
+---
 
-## 一键部署
+### 方式二：本地脚本一键部署
 
-在仓库根目录执行：
+#### 1. 前置准备
+- 安装 [Node.js](https://nodejs.org/)（>= 22.12）与 npm
+- 全局安装 Wrangler 并登录：
+  ```bash
+  npm install -g wrangler
+  wrangler login
+  ```
 
-```bash
-cd cloudflare
-bash deploy.sh
-```
+#### 2. 自定义配置（可选）
+如需修改默认密码或限制，部署前编辑 [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template)。
 
-部署成功后，脚本会输出两类地址：
-
-- Worker API 地址
-- Cloudflare Pages 前端地址
-
-## 可配置项
-
-Cloudflare Workers 默认变量定义在 [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template)。
-
-当前 [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template) 里的 `vars` 目前包括这些变量：
-
-例如：
-
-```toml
-[vars]
-AUTH_PASSWORD = "123"
-ROOM_AUTH = "{\"private\":\"\",\"finance\":\"finance-pass\"}"
-ROOM_LIST = "false"
-HISTORY_LIMIT = "50"
-TEXT_LIMIT = "40960"
-FILE_LIMIT = "204857600"
-FILE_EXPIRE = "3600"
-```
-
-| 变量 | 默认值 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| `AUTH_PASSWORD` | `"123"` | 字符串或布尔语义 | 全局入口密码。只要设置了就对所有房间生效，保证旧密码升级后仍可用 |
-| `ROOM_AUTH` | `{"private":"","finance":"finance-pass"}` | JSON 字符串 | 房间级密码映射。不会让 `AUTH_PASSWORD` 失效，而是为指定房间增加额外可用密码 |
-| `ROOM_LIST` | `"false"` | 布尔语义字符串 | 是否启用房间列表功能，支持 `1`、`true`、`yes`、`on` |
-| `HISTORY_LIMIT` | `"50"` | 整数字符串 | 每个房间保留的历史消息条数 |
-| `TEXT_LIMIT` | `"40960"` | 整数字符串 | 单条文本消息最大长度 |
-| `FILE_LIMIT` | `"204857600"` | 整数字符串 | 单个文件上传大小上限，单位字节 |
-| `FILE_EXPIRE` | `"3600"` | 整数字符串 | 文件过期时间，单位秒 |
-
-### roomAuth 说明
-
-`ROOM_AUTH` 需要是一个 JSON 字符串，对应后端的 `server.roomAuth`。
-
-示例：
-
-```toml
-ROOM_AUTH = "{\"private\":\"\",\"finance\":\"finance-pass\",\"ops\":\"ops-pass\"}"
-```
-
-含义：
-
-- `private: ""` 表示 `private` 房间只接受全局 `AUTH_PASSWORD`
-- `finance: "finance-pass"` 表示 `finance` 房间同时接受全局 `AUTH_PASSWORD` 和 `finance-pass`
-- `ops: "ops-pass"` 表示 `ops` 房间同时接受全局 `AUTH_PASSWORD` 和 `ops-pass`
-
-如果你想修改这些变量，有两种方式：
-
-1. 在部署前直接编辑 [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template)，然后重新执行 [cloudflare/deploy.sh](cloudflare/deploy.sh)
-2. 部署完成后，在 Cloudflare Dashboard 的 Workers 设置中修改变量
-
-注意：除了这些 `vars`，模板里还有几类不是“环境变量”的部署配置：
-
-- D1 绑定：`DB`
-- R2 绑定：`R2_BUCKET`
-- Durable Object 绑定：`WEBSOCKET_ROOM`
-
-这些绑定项同样是运行所必需的，但它们不属于 `vars`，通常由部署脚本自动处理，不需要像密码或限制值那样日常调整。
-
-## 前端配置来源
-
-Pages 前端运行时会使用临时生成的 `config.js`，其模板来自 [cloudflare/pages/client/src/config.js.template](cloudflare/pages/client/src/config.js.template)。
-
-部署脚本会自动把 Worker 地址写入：
-
-- `apiBaseURL`
-- `wsBaseURL`
-
-因此正常情况下不需要手动修改前端配置。
-
-## 数据库迁移
-
-数据库结构定义在 [cloudflare/d1/schema.sql](cloudflare/d1/schema.sql)。
-
-部署脚本会自动执行：
-
-- 远程 D1 迁移：始终执行
-- 本地 D1 迁移：仅在环境允许时执行
-
-如果你后续修改了 schema，可以重新执行部署脚本，或单独运行：
-
-```bash
-cd cloudflare/workers
-wrangler d1 execute cloud-clipboard-db --file=../d1/schema.sql --remote
-```
-
-## macOS 12 注意事项
-
-当前脚本已经兼容较老的 macOS，但如果你使用的是 macOS 13.5 以下版本，本地 D1 迁移会被自动跳过，因为 `workerd` 本地运行有系统版本要求。
-
-这不会影响远程部署。
-
-如果你想显式跳过本地 D1 迁移，可以这样执行：
-
-```bash
-cd cloudflare
-SKIP_LOCAL_D1=1 bash deploy.sh
-```
-
-## 重新部署
-
-如果你只修改了 Workers 变量或逻辑，通常重新执行即可：
-
+#### 3. 执行部署
 ```bash
 cd cloudflare
 bash deploy.sh
 ```
+脚本会自动创建/复用 D1 与 R2 资源、构建前端、执行数据库迁移并部署 Worker。
 
-脚本会自动：
+---
 
-- 复用已存在的 D1 数据库
-- 复用已存在的 R2 存储桶
-- 重新部署 Worker 和 Pages
+## ⚙️ 环境变量与配置说明
 
-## 常见问题
+### 📌 `ROOM_AUTH_JSON` 填法避坑（重点）
 
-### 1. `wrangler whoami` 提示未登录
+`ROOM_AUTH_JSON` 用于配置特定房间的独立密码和文件过期时间。不同配置途径的格式要求不同：
 
-先执行：
+#### 🟢 途径 A：GitHub Secrets / .env / Cloudflare 网页后台（填原始 JSON）
+> ⚠️ **千万不要带 `\` 反斜杠**，直接输入标准 JSON 字符串即可：
 
-```bash
-wrangler login
+```json
+{"finance":{"password":"finance-pass","fileExpire":0},"archive":{"fileExpire":604800},"private":"","tmp":"quick-pass"}
 ```
 
-### 2. 本地 D1 迁移失败
+#### 🔵 途径 B：直接编辑 `wrangler.toml.template` 文件（需要 `\` 转义）
+> ⚠️ 因 TOML 语法双引号字符串限制，文件内必须对内层双引号加 `\` 转义：
 
-如果是 macOS 版本较低，可直接跳过本地迁移：
-
-```bash
-SKIP_LOCAL_D1=1 bash deploy.sh
+```toml
+ROOM_AUTH_JSON = "{\"finance\":{\"password\":\"finance-pass\",\"fileExpire\":0},\"archive\":{\"fileExpire\":604800},\"private\":\"\",\"tmp\":\"quick-pass\"}"
 ```
 
-### 3. 修改了 `wrangler.toml` 或 `config.js`，但文件又消失了
+---
 
-这是正常行为。
+### 📝 房间配置规则与 `fileExpire`
 
-部署脚本会在运行时临时生成：
+每个房间的值支持两种写法：
+1. **简写密码**：`"roomName": "pass"`（仅设置额外密码，文件沿用全局过期时间）
+2. **对象配置**：`"roomName": {"password": "pass", "fileExpire": 0}`
 
-- `cloudflare/workers/wrangler.toml`
-- `cloudflare/pages/client/src/config.js`
+| `fileExpire` 取值 | 含义 |
+| :--- | :--- |
+| **未设置** | 沿用全局 `FILE_EXPIRE` 时间 |
+| **`0`** | **文件永久保留，永不过期**（前端显示“永久有效”） |
+| **`> 0`** | 覆盖全局时间，自定义该房间过期秒数（例如 `604800` 为 7 天） |
 
-部署结束后会自动清理。
+> **注意**：
+> - `fileExpire` 仅在文件上传瞬间生效，后续修改配置不会回溯已上传的文件。
+> - 房间消息总数超过 `HISTORY_LIMIT` 产生轮转清理时，最旧的文件仍会被清理。
 
-如果你要改默认值，请修改模板文件，而不是改临时生成文件：
+---
 
-- [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template)
-- [cloudflare/pages/client/src/config.js.template](cloudflare/pages/client/src/config.js.template)
+## 🗄️ 数据库迁移与运维
 
-### 4. 修改了密码或 `ROOM_AUTH` 后未生效
+- 数据库表结构位于 [cloudflare/d1/schema.sql](cloudflare/d1/schema.sql)。
+- 部署脚本/CI 会自动执行远程迁移。如需单独手动执行迁移：
+  ```bash
+  cd cloudflare/workers
+  wrangler d1 execute cloud-clipboard-db --file=../d1/schema.sql --remote
+  ```
 
-确认你修改的是模板文件 [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template) 或 Cloudflare Dashboard 中的 Worker Variables，然后重新部署。
+---
 
-### 5. Pages 能打开，但 API 或 WebSocket 连接异常
+## ❓ 常见问题排查
 
-优先检查：
-
-1. Worker 是否部署成功
-2. Pages 生成的 `config.js` 是否已写入正确的 Worker URL
-3. Worker 变量中的 `AUTH_PASSWORD` / `ROOM_AUTH` / `ROOM_LIST` 是否符合预期
-4. D1 schema 是否已经迁移到远程数据库
-
-## 相关文件
-
-- [cloudflare/deploy.sh](cloudflare/deploy.sh)
-- [cloudflare/d1/schema.sql](cloudflare/d1/schema.sql)
-- [cloudflare/workers/wrangler.toml.template](cloudflare/workers/wrangler.toml.template)
-- [cloudflare/pages/client/src/config.js.template](cloudflare/pages/client/src/config.js.template)
-- [cloudflare/workers/src/index.js](cloudflare/workers/src/index.js)
+| 问题现象 | 排查与解决办法 |
+| :--- | :--- |
+| **部署提示 `wrangler whoami` 未登录** | 本地运行 `wrangler login`；CI 部署请检查 `CF_API_TOKEN` 和 `CF_ACCOUNT_ID` 是否正确填写。 |
+| **修改了 `wrangler.toml` 后自动丢失** | `wrangler.toml` 是由脚本自动生成的临时文件。请修改模板文件 [wrangler.toml.template](cloudflare/workers/wrangler.toml.template)。 |
+| **页面打开正常，但发消息或上传报错** | 1. 检查 D1 schema 是否已执行迁移；<br>2. 检查 `ROOM_AUTH_JSON` 是否为合法 JSON（避免多余反斜杠或格式错误）；<br>3. 检查 Cloudflare 控制台 Worker 是否成功绑定 D1(`DB`)、R2(`R2_BUCKET`)、Durable Object(`WEBSOCKET_ROOM`)。 |
+| **macOS 提示本地 workerd 无法运行** | macOS 13.5 以下系统 workerd 无法本地运行，可直接运行 `SKIP_LOCAL_D1=1 bash deploy.sh` 跳过本地迁移，不影响远程部署。 |
