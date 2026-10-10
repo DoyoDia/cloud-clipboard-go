@@ -3,6 +3,7 @@ import { broadcastMessage, buildSenderDevice, ensureBoardColumn, historyLimit } 
 import { ensureRoomAccess, normalizeRoomName } from '../auth';
 import { ensureRoomOrShareAccess } from '../share';
 import { errorResponse } from '../errors';
+import { safeFileHeaders } from '../safe-serve';
 
 // 看板的列：**固定三列**（todo / doing / done）。空串/缺失归一成 todo（新条目默认落待办）。
 // 返回 null 表示不认识这个值 —— 调用方必须报错，不能静默回落，否则客户端以为挪成功了。
@@ -175,10 +176,13 @@ export class ContentHandler {
       });
     }
 
-    const contentType = object.httpMetadata?.contentType || 'application/octet-stream';
     const fileType = ContentHandler.determineFileType(result.name);
+    // 用户上传字节一律走安全出口（见 safe-serve.js）：不信上传侧声明的 Content-Type，
+    // 只按白名单决定能否内联，其余一律 application/octet-stream + attachment，并带 nosniff + CSP。
+    // ⚠️ 不能像以前那样因为 fileType==='image' 或 contentType.startsWith('text/') 就 inline ——
+    // 那会把 .svg（image/svg+xml）和 .html（text/html）内联成可执行页面（存储型 XSS）。
+    const safe = safeFileHeaders(result.name, { forceDownload });
     const headers = {
-      'Content-Type': contentType,
       'Content-Length': object.size.toString(),
       'Last-Modified': new Date(parseInt(object.customMetadata?.uploadTime || Date.now(), 10)).toUTCString(),
       'X-Content-ID': result.id.toString(),
@@ -187,22 +191,8 @@ export class ContentHandler {
       'X-File-UUID': result.uuid,
       'X-File-Type': fileType,
       ...corsHeaders,
+      ...safe,
     };
-
-    if (forceDownload) {
-      headers['Content-Disposition'] = `attachment; filename="${encodeURIComponent(result.name)}"`;
-    } else if (
-      fileType === 'image' ||
-      fileType === 'video' ||
-      fileType === 'audio' ||
-      contentType.startsWith('text/') ||
-      contentType === 'application/pdf'
-    ) {
-      headers['Content-Disposition'] = `inline; filename="${encodeURIComponent(result.name)}"`;
-      headers['Cache-Control'] = 'public, max-age=300';
-    } else {
-      headers['Content-Disposition'] = `attachment; filename="${encodeURIComponent(result.name)}"`;
-    }
 
     return new Response(object.body, { headers });
   }
@@ -396,12 +386,9 @@ export class ContentHandler {
         return errorResponse(503, 'database_unavailable', 'Database not available', '数据库不可用');
       }
 
-      const hasRequestedRoom = url.searchParams.has('room');
       const requestedRoom = normalizeRoomName(url.searchParams.get('room'));
-      // 先按条目**自己记录的房间**取，再鉴权 —— 和 getById 同一条思路：不信客户端传的 ?room=
-      const row = hasRequestedRoom
-        ? await env.DB.prepare('SELECT * FROM messages WHERE id = ? AND room = ?').bind(numericId, requestedRoom).first()
-        : await env.DB.prepare('SELECT * FROM messages WHERE id = ? ORDER BY id DESC LIMIT 1').bind(numericId).first();
+      // 不带 ?room= 就是默认房间，不跨房间按 id 查（同 getById）
+      const row = await env.DB.prepare('SELECT * FROM messages WHERE id = ? AND room = ?').bind(numericId, requestedRoom).first();
 
       if (!row) {
         return errorResponse(404, 'content_not_found', 'Content not found', '内容未找到');
@@ -452,7 +439,6 @@ export class ContentHandler {
         return errorResponse(400, 'invalid_content_id', 'Invalid content id', '无效的内容 ID');
       }
       const url = new URL(request.url);
-      const hasRequestedRoom = url.searchParams.has('room');
       const room = normalizeRoomName(url.searchParams.get('room'));
       const explicitFormat = resolveContentFormat(request, url);
       if (explicitFormat === null) {
@@ -468,17 +454,11 @@ export class ContentHandler {
         return errorResponse(503, 'database_unavailable', 'Database not available', '数据库不可用');
       }
 
-      // 先取内容，再按内容所在房间做「密码 OR 分享 token」鉴权
-      let result;
-      if (hasRequestedRoom) {
-        result = await env.DB.prepare('SELECT * FROM messages WHERE id = ? AND room = ?')
-          .bind(parseInt(id, 10), room)
-          .first();
-      } else {
-        result = await env.DB.prepare('SELECT * FROM messages WHERE id = ? ORDER BY id DESC LIMIT 1')
-          .bind(parseInt(id, 10))
-          .first();
-      }
+      // 先取内容，再按内容所在房间做「密码 OR 分享 token」鉴权。
+      // 不带 ?room= 就是默认房间，**不是**「任意房间」—— 否则按自增 id 遍历就能读遍所有开放房间
+      const result = await env.DB.prepare('SELECT * FROM messages WHERE id = ? AND room = ?')
+        .bind(parseInt(id, 10), room)
+        .first();
 
       console.log(`查询结果:`, result);
       

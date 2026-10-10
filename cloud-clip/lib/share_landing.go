@@ -196,7 +196,7 @@ func (s *ClipboardServer) fillShareCardFromContent(r *http.Request, card *shareC
 		if err != nil {
 			return
 		}
-		target, found := s.findShareTarget(contentID, claims.Room, true)
+		target, found := s.findShareTarget(contentID, claims.Room)
 		if !found {
 			card.Title = "内容已被删除或过期"
 			card.Description = "这条分享指向的内容已不在服务器上。"

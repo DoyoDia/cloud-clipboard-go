@@ -422,7 +422,7 @@ export async function canReadSharedFile(env, request, fileUUID, room) {
     return false;
   }
   // 内容必须真的指向**这个**文件 —— 否则就是拿 A 的分享去读 B 的字节。
-  const row = await findContentById(env, contentId, claims.room, true);
+  const row = await findContentById(env, contentId, claims.room);
   if (!row || String(row.uuid || '') !== fileUUID) {
     return false;
   }
@@ -478,19 +478,13 @@ export async function ensureRoomOrShareAccess(request, env, room, {
   };
 }
 
-export async function findContentById(env, contentId, preferredRoom, hasPreferredRoom) {
+export async function findContentById(env, contentId, room) {
   if (!env.DB) {
     return null;
   }
 
-  if (hasPreferredRoom) {
-    return env.DB.prepare('SELECT * FROM messages WHERE id = ? AND room = ? LIMIT 1')
-      .bind(contentId, preferredRoom)
-      .first();
-  }
-
-  return env.DB.prepare('SELECT * FROM messages WHERE id = ? ORDER BY id DESC LIMIT 1')
-    .bind(contentId)
+  return env.DB.prepare('SELECT * FROM messages WHERE id = ? AND room = ? LIMIT 1')
+    .bind(contentId, normalizeRoomName(room))
     .first();
 }
 
@@ -602,7 +596,6 @@ export class ShareHandler {
   static async create(request, env) {
     try {
       const url = new URL(request.url);
-      const hasRequestedRoom = url.searchParams.has('room');
       const requestedRoom = normalizeRoomName(url.searchParams.get('room'));
       const body = await request.json().catch(() => ({}));
       const shareType = String(body?.type || '').trim().toLowerCase();
@@ -620,7 +613,7 @@ export class ShareHandler {
           return errorResponse(400, 'missing_id', 'Bad Request', '缺少 id');
         }
 
-        const row = await findContentById(env, Number(id), requestedRoom, hasRequestedRoom);
+        const row = await findContentById(env, Number(id), requestedRoom);
         if (!row) {
           return errorResponse(404, 'content_not_found', 'Not Found', '内容未找到');
         }
@@ -694,7 +687,7 @@ export class ShareHandler {
         }
 
         const room = normalizeRoomName(fileMeta.room);
-        if (hasRequestedRoom && room !== requestedRoom) {
+        if (room !== requestedRoom) {
           return errorResponse(404, 'file_not_found', 'Not Found', '文件未找到或已过期');
         }
         if (!await canAccessRoomAsync(env, room, authToken)) {
@@ -782,7 +775,7 @@ export class ShareHandler {
       };
 
       if (claims.type === 'content') {
-        const row = await findContentById(env, Number(claims.id), claims.room, true);
+        const row = await findContentById(env, Number(claims.id), claims.room);
         if (!row) {
           return errorResponse(404, 'content_not_found', 'Not Found', '内容未找到');
         }

@@ -74,7 +74,7 @@ async function fillCardFromContent(card, { request, env, claims, token }) {
     if (!Number.isFinite(contentId)) {
       return;
     }
-    const row = await findContentById(env, contentId, claims.room, true);
+    const row = await findContentById(env, contentId, claims.room);
     if (!row) {
       card.title = '内容已被删除或过期';
       card.description = '这条分享指向的内容已不在服务器上。';

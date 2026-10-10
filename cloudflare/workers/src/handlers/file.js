@@ -3,6 +3,7 @@ import { buildSenderDevice, saveToD1, broadcastMessage, generateUUID } from '../
 import { ensureRoomAccess, normalizeRoomName } from '../auth';
 import { ensureRoomOrShareAccess } from '../share';
 import { errorResponse } from '../errors';
+import { safeFileHeaders } from '../safe-serve';
 
 function decodeUploadFilename(value = '') {
   try {
@@ -678,23 +679,19 @@ export class FileHandler {
 
       console.log(`文件下载成功: ${uuid}, size: ${object.size}, type: ${object.httpMetadata?.contentType}`);
 
+      // 用户上传字节一律走安全出口（见 safe-serve.js）：不信上传侧声明的 Content-Type，
+      // 只按白名单决定能否内联，其余一律 application/octet-stream + attachment，并带 nosniff + CSP。
+      // ⚠️ 以前这里无条件 inline，.html/.svg 一传就能在本站源里执行脚本（存储型 XSS）。
+      const url = new URL(request.url);
+      const originalName = object.customMetadata?.originalName || filename || 'file';
+      const forceDownload = url.searchParams.get('download') === 'true';
       const headers = {
-        'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
         'Content-Length': object.size.toString(),
         'Cache-Control': 'public, max-age=3600',
         'Last-Modified': new Date(parseInt(object.customMetadata?.uploadTime || Date.now())).toUTCString(),
-        ...corsHeaders
+        ...corsHeaders,
+        ...safeFileHeaders(originalName, { forceDownload }),
       };
-
-      // 如果请求包含 download=true，设置为附件下载
-      const url = new URL(request.url);
-      const originalName = object.customMetadata?.originalName || filename || 'file';
-      
-      if (url.searchParams.get('download') === 'true') {
-        headers['Content-Disposition'] = buildContentDisposition(originalName, 'attachment');
-      } else {
-        headers['Content-Disposition'] = buildContentDisposition(originalName, 'inline');
-      }
 
       return new Response(object.body, { headers });
 

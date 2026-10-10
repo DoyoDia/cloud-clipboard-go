@@ -259,7 +259,10 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 	latestID := 0
 	s.messageQueue.Lock()
 	for _, msg := range s.messageQueue.List {
-		if msg.Data.Room() != "" && msg.Data.Room() != room {
+		// 与所有 content-lookup 路径一致：按**条目自己记录的房间**（规范化后）严格匹配，
+		// 不把空房间当「任意房间」—— 否则别的房间的 id 会抬高本房间的 latestId，
+		// 客户端据此对齐历史时就会漏取或误判。room 在函数开头已规范化。
+		if normalizeRoomName(msg.Data.Room()) != room {
 			continue
 		}
 		if msg.Data.ID() > latestID {
@@ -422,6 +425,69 @@ func (s *ClipboardServer) handle_push(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// safeInlineContentTypes 是**唯一允许内联展示**（Content-Disposition: inline）的 MIME 白名单。
+// 不在表里的一律以 application/octet-stream 作为附件下载。
+//
+// ⚠️ 用户上传的字节不可信：若按上传文件名的扩展名推出 text/html、application/xhtml+xml、
+// image/svg+xml 或 JS 这类类型再 inline，浏览器会在**本站可信源**里把它当页面/脚本执行
+// —— 这就是存储型 XSS。所以服务端**绝不**拿上传文件名去决定响应 Content-Type，只认这张
+// 白名单，而表里全是「即便内联也不会执行脚本」的类型。
+var safeInlineContentTypes = map[string]bool{
+	"image/png":                true,
+	"image/jpeg":               true,
+	"image/gif":                true,
+	"image/webp":               true,
+	"image/bmp":                true,
+	"image/x-icon":             true,
+	"image/vnd.microsoft.icon": true,
+	"text/plain":               true,
+	"audio/mpeg":               true,
+	"audio/ogg":                true,
+	"audio/wav":                true,
+	"audio/x-wav":              true,
+	"audio/webm":               true,
+	"video/mp4":                true,
+	"video/webm":               true,
+	"video/ogg":                true,
+	"application/pdf":          true,
+}
+
+// safeContentTypeForUpload 由文件名扩展名推一个**安全**的响应类型，并给出能否内联。
+// 不在白名单上的（含 .html/.svg/.js 等）统一降级成 application/octet-stream 且不内联。
+func safeContentTypeForUpload(filename string) (contentType string, inlineAllowed bool) {
+	ct := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename)))
+	if ct != "" {
+		if base, _, err := mime.ParseMediaType(ct); err == nil {
+			ct = base
+		}
+	}
+	if ct != "" && safeInlineContentTypes[strings.ToLower(ct)] {
+		return ct, true
+	}
+	return "application/octet-stream", false
+}
+
+// serveUploadedFile 是**所有**取用户上传字节的路径的唯一出口（handle_file /
+// handleContent / handleLatestContent 共用），避免「只在其中一条加了防护」这种漂移。
+// 它负责：安全的 Content-Type、inline/attachment 的判定，以及防嗅探与隔离用的响应头。
+func serveUploadedFile(w http.ResponseWriter, r *http.Request, filename string, modTime time.Time, content io.ReadSeeker) {
+	contentType, inlineOK := safeContentTypeForUpload(filename)
+	disposition := "attachment"
+	if inlineOK && r.URL.Query().Get("download") != "true" {
+		disposition = "inline"
+	}
+
+	// nosniff：禁止浏览器无视我们给的类型去「猜」成 text/html 再执行。
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// 最严的 CSP + sandbox：即便某类型被内联，也把它和本站源完全隔开，不加载/执行任何东西。
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=%q", disposition, filename))
+
+	// name 传空：Content-Type 已显式设好，避免 ServeContent 再按文件名/嗅探覆盖它。
+	http.ServeContent(w, r, "", modTime, content)
+}
+
 func (s *ClipboardServer) handle_file(w http.ResponseWriter, r *http.Request) {
 	// 修改 UUID 提取逻辑
 	pathPart := strings.TrimPrefix(r.URL.Path, s.config.Server.Prefix+"/file/")
@@ -474,16 +540,8 @@ func (s *ClipboardServer) handle_file(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 设置 Content-Disposition
-		dispositionType := "inline" // 默认为内联显示
-		if r.URL.Query().Get("download") == "true" {
-			dispositionType = "attachment"
-		}
-		disposition := fmt.Sprintf("%s; filename=%q", dispositionType, fileInfo.Name)
-		w.Header().Set("Content-Disposition", disposition)
-
-		// 使用 http.ServeContent 提供文件内容
-		http.ServeContent(w, r, fileInfo.Name, stat.ModTime(), file)
+		// 用户上传字节一律走安全出口：不信文件名定 Content-Type，非白名单一律附件下载。
+		serveUploadedFile(w, r, fileInfo.Name, stat.ModTime(), file)
 
 	case http.MethodDelete:
 		// 需要认证才能删除文件，此处已有 authMiddleware 保护
@@ -795,7 +853,6 @@ func (s *ClipboardServer) handleContentColumn(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	_, hasRequestedRoom := r.URL.Query()["room"]
 	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
 
 	s.messageQueue.Lock()
@@ -806,7 +863,7 @@ func (s *ClipboardServer) handleContentColumn(w http.ResponseWriter, r *http.Req
 			continue
 		}
 		messageRoom := normalizeRoomName(msg.Data.Room())
-		if hasRequestedRoom && messageRoom != requestedRoom {
+		if messageRoom != requestedRoom {
 			continue
 		}
 		// 与 handleContent 同一条鉴权：按**条目自己记录的房间**，不信客户端传的 ?room=
@@ -1156,8 +1213,7 @@ func (s *ClipboardServer) handle_revoke(w http.ResponseWriter, r *http.Request) 
 	}
 
 	token := extractAuthToken(r)
-	requestedRoom, hasRequestedRoom := r.URL.Query()["room"]
-	_ = requestedRoom
+	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
 
 	s.messageQueue.Lock()
 	var foundMsg PostEvent
@@ -1167,7 +1223,7 @@ func (s *ClipboardServer) handle_revoke(w http.ResponseWriter, r *http.Request) 
 	for i := range s.messageQueue.List { // 使用大写 L
 		if s.messageQueue.List[i].Data.ID() == id {
 			messageRoom := normalizeRoomName(s.messageQueue.List[i].Data.Room())
-			if hasRequestedRoom && messageRoom != normalizeRoomName(r.URL.Query().Get("room")) {
+			if messageRoom != requestedRoom {
 				continue
 			}
 			if !s.canAccessRoom(messageRoom, token) {
@@ -1387,9 +1443,9 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid_content_id", "Invalid content id", "无效的内容 ID")
 		return
 	}
-	_, hasRequestedRoom := r.URL.Query()["room"]
+	// 不带 ?room= 就是默认房间，**不是**「任意房间」—— 否则按自增 id 遍历就能读遍所有开放房间
 	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
-	s.logger.Printf("处理内容请求, ID: %d, 房间参数存在: %t, JSON请求: %t", id, hasRequestedRoom, isJSONRequest)
+	s.logger.Printf("处理内容请求, ID: %d, 房间: %s, JSON请求: %t", id, requestedRoom, isJSONRequest)
 
 	s.messageQueue.Lock()
 	defer s.messageQueue.Unlock()
@@ -1400,7 +1456,7 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 		// 检查ID是否匹配
 		if msg.Data.ID() == id {
 			messageRoom := normalizeRoomName(msg.Data.Room())
-			if hasRequestedRoom && messageRoom != requestedRoom {
+			if messageRoom != requestedRoom {
 				continue
 			}
 			// 房间密码 或 针对该 content 的短期分享 token
@@ -1459,12 +1515,9 @@ func (s *ClipboardServer) handleContent(w http.ResponseWriter, r *http.Request) 
 						return
 					}
 
-					dispositionType := "inline"
-					if r.URL.Query().Get("download") == "true" {
-						dispositionType = "attachment"
-					}
-					w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=%q", dispositionType, msg.Data.FileReceive.Name))
-					http.ServeContent(w, r, msg.Data.FileReceive.Name, stat.ModTime(), file)
+					// 用户上传字节一律走安全出口（见 serveUploadedFile）：
+					// 不信文件名定 Content-Type，非白名单类型一律附件下载 + nosniff + CSP。
+					serveUploadedFile(w, r, msg.Data.FileReceive.Name, stat.ModTime(), file)
 					return
 				}
 			case "text":
@@ -1719,7 +1772,7 @@ func (s *ClipboardServer) handleContentList(w http.ResponseWriter, r *http.Reque
 
 func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Request) {
 	token := extractAuthToken(r)
-	_, hasRequestedRoom := r.URL.Query()["room"]
+	// 同 handleContent：不带 ?room= 就是默认房间，不跨房间取「全站最新」
 	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
 
 	explicitFormat, formatOK := resolveContentFormat(r)
@@ -1729,7 +1782,7 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 	}
 	isJSONRequest := explicitFormat == "json"
 
-	s.logger.Printf("处理最新内容请求 (房间参数存在: %t, JSON请求: %t)", hasRequestedRoom, isJSONRequest)
+	s.logger.Printf("处理最新内容请求 (房间: %s, JSON请求: %t)", requestedRoom, isJSONRequest)
 
 	s.messageQueue.Lock()
 	defer s.messageQueue.Unlock()
@@ -1748,8 +1801,7 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 		msg := s.messageQueue.List[i]
 		messageRoom := normalizeRoomName(msg.Data.Room())
 
-		// 检查房间匹配 (空房间参数表示匹配任何房间)
-		if hasRequestedRoom && messageRoom != requestedRoom {
+		if messageRoom != requestedRoom {
 			continue
 		}
 		if !s.canAccessRoom(messageRoom, token) {
@@ -1849,24 +1901,10 @@ func (s *ClipboardServer) handleLatestContent(w http.ResponseWriter, r *http.Req
 				return
 			}
 
-			// 设置响应头，根据文件类型确定内容类型
-			contentType := mime.TypeByExtension(filepath.Ext(filename))
-			if contentType == "" {
-				contentType = "application/octet-stream"
-			}
-			w.Header().Set("Content-Type", contentType)
-
-			// 根据查询参数决定是否作为附件下载
-			dispositionType := "inline" // 默认内联显示
-			if r.URL.Query().Get("download") == "true" {
-				dispositionType = "attachment"
-			}
-			disposition := fmt.Sprintf("%s; filename=%q", dispositionType, filename)
-			w.Header().Set("Content-Disposition", disposition)
-
-			// 提供文件内容
+			// 用户上传字节一律走安全出口（见 serveUploadedFile）：
+			// 不信文件名定 Content-Type，非白名单类型一律附件下载 + nosniff + CSP。
 			s.logger.Printf("直接提供最新文件内容: %s", filename)
-			http.ServeContent(w, r, filename, stat.ModTime(), file)
+			serveUploadedFile(w, r, filename, stat.ModTime(), file)
 			return
 
 		} else if msg.Data.Type() == "text" && msg.Data.TextReceive != nil {

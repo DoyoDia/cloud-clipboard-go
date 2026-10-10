@@ -119,6 +119,23 @@ func NewClipboardServer(cfg *Config) (*ClipboardServer, error) {
 	}
 	cfg.Server.RoomAuth = normalizeRoomAuthConfig(cfg.Server.RoomAuth)
 
+	// 安全提醒（**不改变行为**）：既没有全局密码、也没有任何房间密码时，所有房间都是
+	// 匿名可读写的。单房间、有意公开的部署这是正常的；但生产上跑成这样往往是漏配 ——
+	// 而本次审计里几处 IDOR 的实际杀伤力正是被「全站匿名」放大的。所以大声警告一次，
+	// 别静默放行。（审计里的「全局无密码默认」是部署/配置问题，这里只提示，不强制。）
+	if globalPassword, _ := cfg.Server.Auth.(string); strings.TrimSpace(globalPassword) == "" {
+		hasRoomPassword := false
+		for _, entry := range cfg.Server.RoomAuth {
+			if strings.TrimSpace(entry.Password) != "" {
+				hasRoomPassword = true
+				break
+			}
+		}
+		if !hasRoomPassword {
+			logger.Printf("⚠️ 安全警告：未配置任何认证（无全局 server.auth、无房间密码）—— 所有房间均可被匿名读写。若非有意公开，请设置 server.auth 或为房间配置 roomAuth 密码。")
+		}
+	}
+
 	s := &ClipboardServer{
 		config:          cfg,
 		logger:          logger,

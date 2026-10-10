@@ -485,7 +485,7 @@ func (s *ClipboardServer) canReadSharedFile(r *http.Request, fileUUID, room stri
 		return false
 	}
 	// 内容必须真的指向**这个**文件 —— 否则就是拿 A 的分享去读 B 的字节。
-	_, _, targetUUID, found := s.findContentForShare(contentID, claims.Room, true)
+	_, _, targetUUID, found := s.findContentForShare(contentID, claims.Room)
 	if !found || targetUUID == "" || targetUUID != fileUUID {
 		return false
 	}
@@ -525,7 +525,8 @@ type shareTarget struct {
 
 // findShareTarget 在消息队列里找到这条内容，顺带把摘要要用的字段捞出来。
 // 房间归属规则与 findContentForShare 是同一次扫描，避免两套判定慢慢漂移。
-func (s *ClipboardServer) findShareTarget(contentID int, preferredRoom string, hasPreferredRoom bool) (shareTarget, bool) {
+func (s *ClipboardServer) findShareTarget(contentID int, room string) (shareTarget, bool) {
+	room = normalizeRoomName(room)
 	s.messageQueue.Lock()
 	defer s.messageQueue.Unlock()
 
@@ -534,7 +535,7 @@ func (s *ClipboardServer) findShareTarget(contentID int, preferredRoom string, h
 			continue
 		}
 		messageRoom := normalizeRoomName(msg.Data.Room())
-		if hasPreferredRoom && messageRoom != preferredRoom {
+		if messageRoom != room {
 			continue
 		}
 
@@ -556,8 +557,8 @@ func (s *ClipboardServer) findShareTarget(contentID int, preferredRoom string, h
 	return shareTarget{}, false
 }
 
-func (s *ClipboardServer) findContentForShare(contentID int, preferredRoom string, hasPreferredRoom bool) (room string, msgType string, fileUUID string, ok bool) {
-	target, found := s.findShareTarget(contentID, preferredRoom, hasPreferredRoom)
+func (s *ClipboardServer) findContentForShare(contentID int, preferredRoom string) (room string, msgType string, fileUUID string, ok bool) {
+	target, found := s.findShareTarget(contentID, preferredRoom)
 	if !found {
 		return "", "", "", false
 	}
@@ -655,7 +656,7 @@ func (s *ClipboardServer) handleShareInfo(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusNotFound, "content_not_found", "Content not found", "内容未找到")
 			return
 		}
-		room, msgType, fileUUID, found := s.findContentForShare(contentID, claims.Room, true)
+		room, msgType, fileUUID, found := s.findContentForShare(contentID, claims.Room)
 		if !found {
 			writeError(w, http.StatusNotFound, "content_not_found", "Content not found", "内容未找到")
 			return
@@ -746,7 +747,6 @@ func (s *ClipboardServer) handle_share(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestedRoom := normalizeRoomName(r.URL.Query().Get("room"))
-	_, hasRequestedRoom := r.URL.Query()["room"]
 	ttl := normalizeShareTTL(req.TTL)
 	maxUses := normalizeShareMaxUses(req.MaxUses)
 	authToken := extractAuthToken(r)
@@ -764,7 +764,7 @@ func (s *ClipboardServer) handle_share(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		target, found := s.findShareTarget(contentID, requestedRoom, hasRequestedRoom)
+		target, found := s.findShareTarget(contentID, requestedRoom)
 		if !found {
 			writeError(w, http.StatusNotFound, "content_not_found", "Content not found", "内容未找到")
 			return
@@ -839,7 +839,7 @@ func (s *ClipboardServer) handle_share(w http.ResponseWriter, r *http.Request) {
 		}
 
 		room := normalizeRoomName(fileInfo.Room)
-		if hasRequestedRoom && room != requestedRoom {
+		if room != requestedRoom {
 			writeError(w, http.StatusNotFound, "file_not_found", "File not found or expired", "文件未找到或已过期")
 			return
 		}

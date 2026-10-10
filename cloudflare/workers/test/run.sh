@@ -45,6 +45,14 @@ echo "── 房间鉴权（/file/ 的房间不可被客户端 ?room= 伪造；�
 node --no-warnings test/auth-room.test.mjs
 
 echo
+echo "── 按 id 访问不跨房间（不带 ?room= 就是默认房间，自增 id 遍历读不到别的房间）"
+node --no-warnings test/content-room-scope.test.mjs
+
+echo
+echo "── 上传文件安全送出（.html/.svg 不内联渲染；nosniff + CSP；png 仍可内联）"
+node --no-warnings test/content-safe-serving.test.mjs
+
+echo
 echo "── Android 快捷指令的请求形状（?auth= 查询串 / latest.json 后缀 / 下载不带 room）"
 node --no-warnings test/shortcut-contract.test.mjs
 
